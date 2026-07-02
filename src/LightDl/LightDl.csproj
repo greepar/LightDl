@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>LightDl</PackageId>
-    <Version>0.2.1</Version>
+    <Version>0.2.2</Version>
     <Authors>LightDl Contributors</Authors>
     <Description>A lightweight multi-threaded HTTP downloader for .NET with resume support.</Description>
     <PackageTags>download;http;multipart;resume;aot</PackageTags>

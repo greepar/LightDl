@@ -90,10 +90,34 @@ public sealed class LightDownloader : IDisposable
     }
 
     /// <summary>
+    /// Downloads a URI to an exact file path.
+    /// </summary>
+    public Task<LightDownloadResult> DownloadToFileAsync(
+        Uri url,
+        string filePath,
+        IProgress<LightDownloadProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        return DownloadAsync(LightDownloadRequest.ToFile(url, filePath), progress, cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
     /// Downloads a URL into a directory using the remote file name.
     /// </summary>
     public Task<LightDownloadResult> DownloadToDirectoryAsync(
         string url,
+        string directoryPath,
+        IProgress<LightDownloadProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        return DownloadAsync(LightDownloadRequest.ToDirectory(url, directoryPath), progress, cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Downloads a URI into a directory using the remote file name.
+    /// </summary>
+    public Task<LightDownloadResult> DownloadToDirectoryAsync(
+        Uri url,
         string directoryPath,
         IProgress<LightDownloadProgress>? progress = null,
         CancellationToken cancellationToken = default)
@@ -107,7 +131,8 @@ public sealed class LightDownloader : IDisposable
         IProgress<LightDownloadFileInfo>? fileInfo,
         CancellationToken ct)
     {
-        var url = request.Url;
+        var url = request.RequestUri;
+        var urlString = request.Url;
         var headers = request.Headers;
         var info = await ProbeFileInfoAsync(url, headers, ct).ConfigureAwait(false);
         fileInfo?.Report(info);
@@ -152,7 +177,7 @@ public sealed class LightDownloader : IDisposable
         var metadataPath = destinationPath + _config.MetadataFileExtension;
         try
         {
-            var metadata = LoadOrCreateMetadata(url, totalLength, tempPath, metadataPath);
+            var metadata = LoadOrCreateMetadata(urlString, totalLength, tempPath, metadataPath);
             var completedRanges = MergeRanges(metadata.CompletedRanges.Select(r => new DownloadRange(r.Start, r.End)).ToList());
 
             Preallocate(tempPath, totalLength);
@@ -262,7 +287,7 @@ public sealed class LightDownloader : IDisposable
         }
     }
 
-    private async Task<LightDownloadFileInfo> ProbeFileInfoAsync(string url, IReadOnlyDictionary<string, string>? headers, CancellationToken ct)
+    private async Task<LightDownloadFileInfo> ProbeFileInfoAsync(Uri url, IReadOnlyDictionary<string, string>? headers, CancellationToken ct)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Range = new RangeHeaderValue(0, 0);
@@ -288,7 +313,7 @@ public sealed class LightDownloader : IDisposable
 
         return new LightDownloadFileInfo
         {
-            FileName = GetFileName(response.RequestMessage?.RequestUri?.ToString() ?? url, response),
+            FileName = GetFileName(response.RequestMessage?.RequestUri ?? url, response),
             Size = size,
             ContentType = response.Content.Headers.ContentType?.ToString(),
             SupportsRange = supportsRange,
@@ -296,7 +321,7 @@ public sealed class LightDownloader : IDisposable
     }
 
     private async Task DownloadChunkAsync(
-        string url,
+        Uri url,
         string path,
         long start,
         long end,
@@ -401,7 +426,7 @@ public sealed class LightDownloader : IDisposable
         return globalSpeed > 0 && segmentSpeed < globalSpeed * _config.SlowSpeedRatio;
     }
 
-    private async Task DownloadSingleThreadAsync(string url, string path, long totalLength, IReadOnlyDictionary<string, string>? headers, Action<LightDownloadProgress>? progressChanged, CancellationToken ct)
+    private async Task DownloadSingleThreadAsync(Uri url, string path, long totalLength, IReadOnlyDictionary<string, string>? headers, Action<LightDownloadProgress>? progressChanged, CancellationToken ct)
     {
         var downloaded = new AtomicLong();
         var sw = Stopwatch.StartNew();
@@ -699,19 +724,16 @@ public sealed class LightDownloader : IDisposable
         }
     }
 
-    private static string GetFileName(string url, HttpResponseMessage response)
+    private static string GetFileName(Uri url, HttpResponseMessage response)
     {
         var contentDisposition = response.Content.Headers.ContentDisposition;
         var fileName = contentDisposition?.FileNameStar ?? contentDisposition?.FileName;
         if (!string.IsNullOrWhiteSpace(fileName))
             return SanitizeFileName(fileName.Trim('"'));
 
-        if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
-        {
-            var pathFileName = Path.GetFileName(uri.LocalPath);
-            if (!string.IsNullOrWhiteSpace(pathFileName))
-                return SanitizeFileName(Uri.UnescapeDataString(pathFileName));
-        }
+        var pathFileName = Path.GetFileName(url.LocalPath);
+        if (!string.IsNullOrWhiteSpace(pathFileName))
+            return SanitizeFileName(Uri.UnescapeDataString(pathFileName));
 
         return "download";
     }

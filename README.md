@@ -13,7 +13,7 @@ dotnet add package LightDl
 Or add it to your `.csproj`:
 
 ```xml
-<PackageReference Include="LightDl" Version="0.2.1" />
+<PackageReference Include="LightDl" Version="0.2.2" />
 ```
 
 ## Usage
@@ -21,7 +21,8 @@ Or add it to your `.csproj`:
 ```csharp
 using LightDl;
 
-var request = LightDownloadRequest.ToDirectory("https://example.com/file.zip", AppContext.BaseDirectory)
+var url = new Uri("https://example.com/file.zip");
+var request = LightDownloadRequest.ToDirectory(url, AppContext.BaseDirectory)
     .OnFileInfo(info => Console.WriteLine($"Downloading {info.FileName} ({info.Size} bytes)"))
     .OnProgress(p => Console.Write($"\r{p.ProgressPercentage:F1}%  {p.Speed / 1024 / 1024:F1} MB/s"));
 
@@ -35,6 +36,12 @@ Pass a directory to use the remote file name, or pass a full file path to choose
 ```csharp
 await LightDownload.DownloadAsync(LightDownloadRequest.ToDirectory(url, @"C:\Downloads\"));
 await LightDownload.DownloadAsync(LightDownloadRequest.ToFile(url, @"C:\Downloads\custom-name.zip"));
+```
+
+String URL overloads are also available for simple scripts:
+
+```csharp
+await LightDownload.DownloadAsync(LightDownloadRequest.ToDirectory("https://example.com/file.zip", @"C:\Downloads\"));
 ```
 
 With options:
