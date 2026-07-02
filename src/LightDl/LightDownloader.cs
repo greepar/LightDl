@@ -11,17 +11,16 @@ namespace LightDl;
 /// </summary>
 public sealed class LightDownloader : IDisposable
 {
+    private const long MetadataFlushBytes = 4L * 1024 * 1024;
+
     private readonly LightDownloadConfig _config;
     private readonly HttpClient _http;
     private readonly Lock _metadataLock = new();
     private bool _disposed;
 
-    /// <summary>Progress callback fired every <see cref="LightDownloadConfig.ProgressIntervalMs"/> milliseconds while downloading.</summary>
-    public event Action<LightDownloadProgress>? ProgressChanged;
-
     public LightDownloader(LightDownloadConfig? config = null)
     {
-        _config = config ?? new LightDownloadConfig();
+        _config = (config ?? new LightDownloadConfig()).Clone();
         NormalizeConfig(_config);
 
         var handler = new SocketsHttpHandler
@@ -45,138 +44,244 @@ public sealed class LightDownloader : IDisposable
     }
 
     /// <summary>
-    /// Downloads a file to the specified destination path.
+    /// Downloads a request and returns the completed file result.
     /// </summary>
-    public async Task DownloadAsync(string url, string destinationPath, CancellationToken ct = default)
+    public async Task<LightDownloadResult> DownloadAsync(
+        LightDownloadRequest request,
+        IProgress<LightDownloadProgress>? progress = null,
+        IProgress<LightDownloadFileInfo>? fileInfo = null,
+        CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(request);
 
-        var (totalLength, supportsRange) = await ProbeAsync(url, ct).ConfigureAwait(false);
-        if (!supportsRange)
+        return await DownloadCoreAsync(request, progress, fileInfo, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Downloads a request and returns the completed file result.
+    /// </summary>
+    public Task<LightDownloadResult> DownloadAsync(LightDownloadRequest request, CancellationToken cancellationToken)
+    {
+        return DownloadAsync(request, progress: null, fileInfo: null, cancellationToken);
+    }
+
+    /// <summary>
+    /// Downloads a URL to an exact file path.
+    /// </summary>
+    public Task<LightDownloadResult> DownloadToFileAsync(
+        string url,
+        string filePath,
+        IProgress<LightDownloadProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        return DownloadAsync(LightDownloadRequest.ToFile(url, filePath), progress, cancellationToken: cancellationToken);
+    }
+
+    /// <summary>
+    /// Downloads a URL into a directory using the remote file name.
+    /// </summary>
+    public Task<LightDownloadResult> DownloadToDirectoryAsync(
+        string url,
+        string directoryPath,
+        IProgress<LightDownloadProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        return DownloadAsync(LightDownloadRequest.ToDirectory(url, directoryPath), progress, cancellationToken: cancellationToken);
+    }
+
+    private async Task<LightDownloadResult> DownloadCoreAsync(
+        LightDownloadRequest request,
+        IProgress<LightDownloadProgress>? progress,
+        IProgress<LightDownloadFileInfo>? fileInfo,
+        CancellationToken ct)
+    {
+        var url = request.Url;
+        var headers = request.Headers;
+        var info = await ProbeFileInfoAsync(url, headers, ct).ConfigureAwait(false);
+        fileInfo?.Report(info);
+        request.FileInfoHandler?.Invoke(info);
+        Action<LightDownloadProgress>? progressChanged = progress is null && request.ProgressHandler is null
+            ? null
+            : value =>
+            {
+                progress?.Report(value);
+                request.ProgressHandler?.Invoke(value);
+            };
+        var totalLength = info.Size;
+        var destinationPath = ResolveDestinationPath(request.DestinationPath, info.FileName, request.DestinationKind);
+        if (TryHandleExistingFile(info, ref destinationPath, out var skippedResult))
         {
-            await DownloadSingleThreadAsync(url, destinationPath, totalLength, ct).ConfigureAwait(false);
-            return;
+            progressChanged?.Invoke(new LightDownloadProgress
+            {
+                DownloadedBytes = skippedResult.Size,
+                TotalBytes = skippedResult.Size,
+                Speed = 0
+            });
+            return skippedResult;
+        }
+
+        if (!info.SupportsRange)
+        {
+            try
+            {
+                await DownloadSingleThreadAsync(url, destinationPath, totalLength, headers, progressChanged, ct).ConfigureAwait(false);
+                return CreateDownloadResult(info, destinationPath);
+            }
+            catch
+            {
+                if (!_config.EnableResume)
+                    DeleteIfExists(destinationPath);
+
+                throw;
+            }
         }
 
         var tempPath = _config.EnableResume ? destinationPath + _config.TempFileExtension : destinationPath;
         var metadataPath = destinationPath + _config.MetadataFileExtension;
-        var metadata = LoadOrCreateMetadata(url, totalLength, tempPath, metadataPath);
-        var completedRanges = MergeRanges(metadata.CompletedRanges.Select(r => new DownloadRange(r.Start, r.End)).ToList());
-
-        Preallocate(tempPath, totalLength);
-
-        var allocator = new RangeAllocator(BuildMissingRanges(totalLength, completedRanges));
-        var retryQueue = new ConcurrentQueue<DownloadSegment>();
-        var activeSegments = 0;
-        var downloaded = new AtomicLong(completedRanges.Sum(r => r.End - r.Start + 1));
-        var currentConcurrency = Math.Min(_config.ChunkCount, _config.MaxChunkCount);
-        var currentSegmentSize = CalculateStableSegmentSize(totalLength, currentConcurrency);
-        var stopwatch = Stopwatch.StartNew();
-
-        using var progressCts = new CancellationTokenSource();
-        var progressTask = ReportProgressAndAdaptLoop(
-            progressCts.Token,
-            downloaded.Read,
-            totalLength,
-            () => Volatile.Read(ref currentConcurrency),
-            value => Volatile.Write(ref currentConcurrency, value),
-            () => Interlocked.Read(ref currentSegmentSize),
-            value => Interlocked.Exchange(ref currentSegmentSize, value));
-
-        var workerCount = _config.EnableDynamicConcurrency ? _config.MaxChunkCount : _config.ChunkCount;
-        var workers = new Task[workerCount];
-        for (var workerIndex = 0; workerIndex < workerCount; workerIndex++)
+        try
         {
-            var index = workerIndex;
-            workers[index] = Task.Run(async () =>
+            var metadata = LoadOrCreateMetadata(url, totalLength, tempPath, metadataPath);
+            var completedRanges = MergeRanges(metadata.CompletedRanges.Select(r => new DownloadRange(r.Start, r.End)).ToList());
+
+            Preallocate(tempPath, totalLength);
+
+            var allocator = new RangeAllocator(BuildMissingRanges(totalLength, completedRanges));
+            var retryQueue = new ConcurrentQueue<DownloadSegment>();
+            var activeSegments = 0;
+            var downloaded = new AtomicLong(completedRanges.Sum(r => r.End - r.Start + 1));
+            var currentConcurrency = Math.Min(_config.ChunkCount, _config.MaxChunkCount);
+            var currentSegmentSize = CalculateStableSegmentSize(totalLength, currentConcurrency);
+            var stopwatch = Stopwatch.StartNew();
+
+            using var progressCts = new CancellationTokenSource();
+            var progressTask = ReportProgressAndAdaptLoop(
+                progressCts.Token,
+                downloaded.Read,
+                totalLength,
+                progressChanged,
+                () => Volatile.Read(ref currentConcurrency),
+                value => Volatile.Write(ref currentConcurrency, value),
+                () => Interlocked.Read(ref currentSegmentSize),
+                value => Interlocked.Exchange(ref currentSegmentSize, value));
+
+            var workerCount = _config.EnableDynamicConcurrency ? _config.MaxChunkCount : _config.ChunkCount;
+            var workers = new Task[workerCount];
+            for (var workerIndex = 0; workerIndex < workerCount; workerIndex++)
             {
-                while (true)
+                var index = workerIndex;
+                workers[index] = Task.Run(async () =>
                 {
-                    ct.ThrowIfCancellationRequested();
-
-                    if (index >= Volatile.Read(ref currentConcurrency))
+                    while (true)
                     {
-                        if (allocator.IsEmpty && retryQueue.IsEmpty && Volatile.Read(ref activeSegments) == 0)
-                            break;
+                        ct.ThrowIfCancellationRequested();
 
-                        await Task.Delay(100, ct).ConfigureAwait(false);
-                        continue;
+                        if (index >= Volatile.Read(ref currentConcurrency))
+                        {
+                            if (allocator.IsEmpty && retryQueue.IsEmpty && Volatile.Read(ref activeSegments) == 0)
+                                break;
+
+                            await Task.Delay(100, ct).ConfigureAwait(false);
+                            continue;
+                        }
+
+                        if (!retryQueue.TryDequeue(out var segment) && !allocator.TryRent(Interlocked.Read(ref currentSegmentSize), out segment))
+                        {
+                            if (Volatile.Read(ref activeSegments) == 0)
+                                break;
+
+                            await Task.Delay(100, ct).ConfigureAwait(false);
+                            continue;
+                        }
+
+                        Interlocked.Increment(ref activeSegments);
+                        try
+                        {
+                            await DownloadChunkAsync(url, tempPath, segment.Start, segment.End,
+                                downloaded.Add,
+                                downloaded.Read, totalLength, stopwatch, headers,
+                                (rangeStart, rangeEnd) => AddCompletedRange(metadata, metadataPath, rangeStart, rangeEnd),
+                                ct).ConfigureAwait(false);
+                        }
+                        catch (SegmentRetryException ex) when (segment.RetryCount < _config.MaxRetry)
+                        {
+                            if (ex.NextStart > segment.Start)
+                                AddCompletedRange(metadata, metadataPath, segment.Start, Math.Min(ex.NextStart - 1, segment.End));
+
+                            if (ex.NextStart <= segment.End)
+                                retryQueue.Enqueue(new DownloadSegment(ex.NextStart, segment.End, segment.RetryCount + 1));
+
+                            await Task.Delay(500 * (segment.RetryCount + 1), ct).ConfigureAwait(false);
+                        }
+                        catch (Exception) when (segment.RetryCount < _config.MaxRetry)
+                        {
+                            retryQueue.Enqueue(new DownloadSegment(segment.Start, segment.End, segment.RetryCount + 1));
+                            await Task.Delay(500 * (segment.RetryCount + 1), ct).ConfigureAwait(false);
+                        }
+                        finally
+                        {
+                            Interlocked.Decrement(ref activeSegments);
+                        }
                     }
+                }, ct);
+            }
 
-                    if (!retryQueue.TryDequeue(out var segment) && !allocator.TryRent(Interlocked.Read(ref currentSegmentSize), out segment))
-                    {
-                        if (Volatile.Read(ref activeSegments) == 0)
-                            break;
+            await Task.WhenAll(workers).ConfigureAwait(false);
 
-                        await Task.Delay(100, ct).ConfigureAwait(false);
-                        continue;
-                    }
+            await progressCts.CancelAsync();
+            try { await progressTask.ConfigureAwait(false); } catch (OperationCanceledException) { }
 
-                    Interlocked.Increment(ref activeSegments);
-                    try
-                    {
-                        await DownloadChunkAsync(url, tempPath, segment.Start, segment.End,
-                            downloaded.Add,
-                            downloaded.Read, totalLength, stopwatch, ct).ConfigureAwait(false);
-
-                        AddCompletedRange(metadata, metadataPath, segment.Start, segment.End);
-                    }
-                    catch (SegmentRetryException ex) when (segment.RetryCount < _config.MaxRetry)
-                    {
-                        if (ex.NextStart > segment.Start)
-                            AddCompletedRange(metadata, metadataPath, segment.Start, Math.Min(ex.NextStart - 1, segment.End));
-
-                        if (ex.NextStart <= segment.End)
-                            retryQueue.Enqueue(new DownloadSegment(ex.NextStart, segment.End, segment.RetryCount + 1));
-
-                        await Task.Delay(500 * (segment.RetryCount + 1), ct).ConfigureAwait(false);
-                    }
-                    catch (Exception) when (segment.RetryCount < _config.MaxRetry)
-                    {
-                        retryQueue.Enqueue(new DownloadSegment(segment.Start, segment.End, segment.RetryCount + 1));
-                        await Task.Delay(500 * (segment.RetryCount + 1), ct).ConfigureAwait(false);
-                    }
-                    finally
-                    {
-                        Interlocked.Decrement(ref activeSegments);
-                    }
-                }
-            }, ct);
-        }
-
-        await Task.WhenAll(workers).ConfigureAwait(false);
-
-        await progressCts.CancelAsync();
-        try { await progressTask.ConfigureAwait(false); } catch (OperationCanceledException) { }
-
-        stopwatch.Stop();
-        if (_config.EnableResume)
-        {
+            stopwatch.Stop();
+            if (!_config.EnableResume) return CreateDownloadResult(info, destinationPath);
             if (File.Exists(destinationPath))
                 File.Delete(destinationPath);
 
             File.Move(tempPath, destinationPath);
             if (File.Exists(metadataPath))
                 File.Delete(metadataPath);
+
+            return CreateDownloadResult(info, destinationPath);
+        }
+        catch
+        {
+            if (!_config.EnableResume)
+                DeletePartialFiles(destinationPath, tempPath, metadataPath);
+
+            throw;
         }
     }
 
-    private async Task<(long Size, bool SupportsRange)> ProbeAsync(string url, CancellationToken ct)
+    private async Task<LightDownloadFileInfo> ProbeFileInfoAsync(string url, IReadOnlyDictionary<string, string>? headers, CancellationToken ct)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
         request.Headers.Range = new RangeHeaderValue(0, 0);
+        ApplyHeaders(request, headers);
 
         using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
 
         var supportsRange = response.StatusCode == System.Net.HttpStatusCode.PartialContent;
+        long size;
         if (supportsRange && response.Content.Headers.ContentRange is { Length: { } len })
-            return (len, true);
+        {
+            size = len;
+        }
+        else if (response.Content.Headers.ContentLength is { } cl)
+        {
+            size = cl;
+        }
+        else
+        {
+            throw new InvalidOperationException("The server did not return the file size, so chunked download cannot continue.");
+        }
 
-        if (response.Content.Headers.ContentLength is { } cl)
-            return (cl, false);
-
-        throw new InvalidOperationException("The server did not return the file size, so chunked download cannot continue.");
+        return new LightDownloadFileInfo
+        {
+            FileName = GetFileName(response.RequestMessage?.RequestUri?.ToString() ?? url, response),
+            Size = size,
+            ContentType = response.Content.Headers.ContentType?.ToString(),
+            SupportsRange = supportsRange,
+        };
     }
 
     private async Task DownloadChunkAsync(
@@ -188,9 +293,12 @@ public sealed class LightDownloader : IDisposable
         Func<long> getGlobalDownloaded,
         long totalLength,
         Stopwatch globalStopwatch,
+        IReadOnlyDictionary<string, string>? headers,
+        Action<long, long> onRangeCompleted,
         CancellationToken ct)
     {
         var currentOffset = start;
+        var lastCommittedOffset = start;
         var segmentBytes = 0L;
         var segmentStopwatch = Stopwatch.StartNew();
 
@@ -198,6 +306,7 @@ public sealed class LightDownloader : IDisposable
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
             request.Headers.Range = new RangeHeaderValue(start, end);
+            ApplyHeaders(request, headers);
 
             using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
             if (response.StatusCode != System.Net.HttpStatusCode.PartialContent)
@@ -236,10 +345,21 @@ public sealed class LightDownloader : IDisposable
                 segmentBytes += read;
                 onBytesReceived(read);
 
+                if (currentOffset - lastCommittedOffset >= MetadataFlushBytes)
+                {
+                    onRangeCompleted(lastCommittedOffset, currentOffset - 1);
+                    lastCommittedOffset = currentOffset;
+                }
+
+                await ApplySpeedLimitAsync(getGlobalDownloaded(), globalStopwatch, ct).ConfigureAwait(false);
+
                 var remainingBytes = end - currentOffset + 1;
                 if (remainingBytes >= _config.MinRemainingBytesForRequeue && IsSlowSegment(segmentBytes, segmentStopwatch, getGlobalDownloaded, globalStopwatch))
                     throw new SegmentRetryException(currentOffset, "The connection is much slower than the global average and will be requeued.");
             }
+
+            if (currentOffset > lastCommittedOffset)
+                onRangeCompleted(lastCommittedOffset, currentOffset - 1);
         }
         catch (SegmentRetryException)
         {
@@ -270,15 +390,16 @@ public sealed class LightDownloader : IDisposable
         return globalSpeed > 0 && segmentSpeed < globalSpeed * _config.SlowSpeedRatio;
     }
 
-    private async Task DownloadSingleThreadAsync(string url, string path, long totalLength, CancellationToken ct)
+    private async Task DownloadSingleThreadAsync(string url, string path, long totalLength, IReadOnlyDictionary<string, string>? headers, Action<LightDownloadProgress>? progressChanged, CancellationToken ct)
     {
         var downloaded = new AtomicLong();
         var sw = Stopwatch.StartNew();
 
         using var progressCts = new CancellationTokenSource();
-        var progressTask = ReportProgressOnlyLoop(progressCts.Token, downloaded.Read, totalLength);
+        var progressTask = ReportProgressOnlyLoop(progressCts.Token, downloaded.Read, totalLength, progressChanged);
 
         using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        ApplyHeaders(request, headers);
         using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
 
@@ -292,6 +413,7 @@ public sealed class LightDownloader : IDisposable
         {
             await dest.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
             downloaded.Add(read);
+            await ApplySpeedLimitAsync(downloaded.Read(), sw, ct).ConfigureAwait(false);
         }
 
         await progressCts.CancelAsync();
@@ -299,7 +421,7 @@ public sealed class LightDownloader : IDisposable
         sw.Stop();
     }
 
-    private async Task ReportProgressOnlyLoop(CancellationToken ct, Func<long> getDownloaded, long total)
+    private async Task ReportProgressOnlyLoop(CancellationToken ct, Func<long> getDownloaded, long total, Action<LightDownloadProgress>? progressChanged)
     {
         var lastBytes = getDownloaded();
         var lastTime = Stopwatch.GetTimestamp();
@@ -313,12 +435,13 @@ public sealed class LightDownloader : IDisposable
             lastBytes = nowBytes;
             lastTime = nowTime;
 
-            ProgressChanged?.Invoke(new LightDownloadProgress
+            var progress = new LightDownloadProgress
             {
                 DownloadedBytes = nowBytes,
                 TotalBytes = total,
                 Speed = speed,
-            });
+            };
+            progressChanged?.Invoke(progress);
         }
     }
 
@@ -326,6 +449,7 @@ public sealed class LightDownloader : IDisposable
         CancellationToken ct,
         Func<long> getDownloaded,
         long total,
+        Action<LightDownloadProgress>? progressChanged,
         Func<int> getConcurrency,
         Action<int> setConcurrency,
         Func<long> getSegmentSize,
@@ -344,12 +468,13 @@ public sealed class LightDownloader : IDisposable
             var seconds = (nowTime - lastTime) / (double)Stopwatch.Frequency;
             var speed = seconds > 0 ? (nowBytes - lastBytes) / seconds : 0;
 
-            ProgressChanged?.Invoke(new LightDownloadProgress
+            var progress = new LightDownloadProgress
             {
                 DownloadedBytes = nowBytes,
                 TotalBytes = total,
                 Speed = speed,
-            });
+            };
+            progressChanged?.Invoke(progress);
 
             if (DateTimeOffset.UtcNow - lastAdapt >= _config.AdaptInterval)
             {
@@ -397,6 +522,18 @@ public sealed class LightDownloader : IDisposable
         {
             setConcurrency(concurrency - 1);
         }
+    }
+
+    private async Task ApplySpeedLimitAsync(long downloadedBytes, Stopwatch stopwatch, CancellationToken ct)
+    {
+        var limit = _config.SpeedLimitProvider?.Invoke();
+        if (limit is null or <= 0 || downloadedBytes <= 0)
+            return;
+
+        var expectedSeconds = downloadedBytes / limit.Value;
+        var delay = expectedSeconds - stopwatch.Elapsed.TotalSeconds;
+        if (delay > 0.01)
+            await Task.Delay(TimeSpan.FromSeconds(Math.Min(delay, 1)), ct).ConfigureAwait(false);
     }
 
     private long CalculateStableSegmentSize(long totalLength, int concurrency)
@@ -455,16 +592,40 @@ public sealed class LightDownloader : IDisposable
     {
         var tempPath = metadataPath + ".tmp";
         File.WriteAllText(tempPath, JsonSerializer.Serialize(metadata, LightDlJsonContext.Default.DownloadMetadata));
-        if (File.Exists(metadataPath))
-            File.Delete(metadataPath);
+        File.SetAttributes(tempPath, FileAttributes.Hidden);
 
-        File.Move(tempPath, metadataPath);
+        if (File.Exists(metadataPath))
+            File.Replace(tempPath, metadataPath, null);
+        else
+            File.Move(tempPath, metadataPath);
     }
 
     private static void Preallocate(string path, long totalLength)
     {
         using var fs = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Write, 4096, FileOptions.None);
         fs.SetLength(totalLength);
+    }
+
+    private static void DeletePartialFiles(string destinationPath, string tempPath, string metadataPath)
+    {
+        DeleteIfExists(tempPath);
+        DeleteIfExists(metadataPath);
+
+        if (string.Equals(tempPath, destinationPath, StringComparison.OrdinalIgnoreCase))
+            DeleteIfExists(destinationPath);
+    }
+
+    private static void DeleteIfExists(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+        catch
+        {
+            // Cleanup is best-effort. Preserve the original download exception.
+        }
     }
 
     private static List<DownloadRange> BuildMissingRanges(long totalLength, List<DownloadRange> completedRanges)
@@ -513,6 +674,122 @@ public sealed class LightDownloader : IDisposable
     {
         if (contentRange?.From != start || contentRange.To != end || contentRange.Length != totalLength)
             throw new SegmentRetryException(start, "The server returned a Content-Range that does not match the requested range.");
+    }
+
+    private static void ApplyHeaders(HttpRequestMessage request, IReadOnlyDictionary<string, string>? headers)
+    {
+        if (headers is null)
+            return;
+
+        foreach (var (name, value) in headers)
+        {
+            request.Headers.Remove(name);
+            request.Headers.TryAddWithoutValidation(name, value);
+        }
+    }
+
+    private static string GetFileName(string url, HttpResponseMessage response)
+    {
+        var contentDisposition = response.Content.Headers.ContentDisposition;
+        var fileName = contentDisposition?.FileNameStar ?? contentDisposition?.FileName;
+        if (!string.IsNullOrWhiteSpace(fileName))
+            return SanitizeFileName(fileName.Trim('"'));
+
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            var pathFileName = Path.GetFileName(uri.LocalPath);
+            if (!string.IsNullOrWhiteSpace(pathFileName))
+                return SanitizeFileName(Uri.UnescapeDataString(pathFileName));
+        }
+
+        return "download";
+    }
+
+    private bool TryHandleExistingFile(LightDownloadFileInfo info, ref string destinationPath, out LightDownloadResult result)
+    {
+        result = null!;
+        if (!File.Exists(destinationPath))
+            return false;
+
+        switch (_config.FileConflictPolicy)
+        {
+            case LightDownloadFileConflictPolicy.Overwrite:
+                return false;
+
+            case LightDownloadFileConflictPolicy.Fail:
+                throw new IOException($"The destination file already exists: {destinationPath}");
+
+            case LightDownloadFileConflictPolicy.Skip:
+                result = CreateDownloadResult(info, destinationPath, skipped: true, size: new FileInfo(destinationPath).Length);
+                return true;
+
+            case LightDownloadFileConflictPolicy.Rename:
+                destinationPath = GetUniqueFilePath(destinationPath);
+                return false;
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(_config.FileConflictPolicy), _config.FileConflictPolicy, "Unknown file conflict policy.");
+        }
+    }
+
+    private static string ResolveDestinationPath(string path, string fileName, LightDownloadDestinationKind destinationKind)
+    {
+        switch (destinationKind)
+        {
+            case LightDownloadDestinationKind.File:
+                if (Directory.Exists(path))
+                    throw new IOException($"The destination file path points to an existing directory: {path}");
+
+                var directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrWhiteSpace(directory))
+                    Directory.CreateDirectory(directory);
+
+                return path;
+
+            case LightDownloadDestinationKind.Directory:
+                Directory.CreateDirectory(path);
+                return Path.Combine(path, fileName);
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(destinationKind), destinationKind, "Unknown destination kind.");
+        }
+    }
+
+    private static string GetUniqueFilePath(string path)
+    {
+        var directory = Path.GetDirectoryName(path);
+        var name = Path.GetFileNameWithoutExtension(path);
+        var extension = Path.GetExtension(path);
+
+        for (var i = 1; ; i++)
+        {
+            var candidateName = string.IsNullOrEmpty(extension) ? $"{name} ({i})" : $"{name} ({i}){extension}";
+            var candidate = string.IsNullOrWhiteSpace(directory) ? candidateName : Path.Combine(directory, candidateName);
+            if (!File.Exists(candidate))
+                return candidate;
+        }
+    }
+
+    private static LightDownloadResult CreateDownloadResult(LightDownloadFileInfo info, string destinationPath, bool skipped = false, long? size = null)
+    {
+        return new LightDownloadResult
+        {
+            FileName = Path.GetFileName(destinationPath),
+            FilePath = destinationPath,
+            Size = size ?? info.Size,
+            ContentType = info.ContentType,
+            SupportsRange = info.SupportsRange,
+            Skipped = skipped
+        };
+    }
+
+    private static string SanitizeFileName(string fileName)
+    {
+        foreach (var invalidChar in Path.GetInvalidFileNameChars())
+            fileName = fileName.Replace(invalidChar, '_');
+
+        fileName = fileName.Trim();
+        return string.IsNullOrWhiteSpace(fileName) ? "download" : fileName;
     }
 
     private static void NormalizeConfig(LightDownloadConfig config)

@@ -45,7 +45,7 @@ public class LightDownloadConfig
     public int BufferSize { get; set; } = 128 * 1024;
 
     /// <summary>Maximum retry count per segment.</summary>
-    public int MaxRetry { get; set; } = 10;
+    public int MaxRetry { get; set; } = 20;
 
     /// <summary>Minimum segment runtime before slow-connection detection starts. Default is 15 seconds.</summary>
     public TimeSpan SlowSegmentMinDuration { get; set; } = TimeSpan.FromSeconds(15);
@@ -62,8 +62,14 @@ public class LightDownloadConfig
     /// <summary>Progress report interval in milliseconds. Default is 500 ms.</summary>
     public int ProgressIntervalMs { get; set; } = 500;
 
+    /// <summary>Optional dynamic speed limit provider in bytes per second. Null or non-positive means unlimited.</summary>
+    public Func<double?>? SpeedLimitProvider { get; set; }
+
     /// <summary>Enables resume support. Enabled by default.</summary>
     public bool EnableResume { get; set; } = true;
+
+    /// <summary>How to handle an existing destination file. Default is overwrite.</summary>
+    public LightDownloadFileConflictPolicy FileConflictPolicy { get; set; } = LightDownloadFileConflictPolicy.Overwrite;
 
     /// <summary>Temporary data file extension used for resume support.</summary>
     public string TempFileExtension { get; set; } = ".lightdl";
@@ -73,4 +79,36 @@ public class LightDownloadConfig
 
     /// <summary>Ignores SSL certificate validation errors.</summary>
     public bool IgnoreSslErrors { get; set; }
+
+    internal LightDownloadConfig Clone()
+    {
+        return new LightDownloadConfig
+        {
+            ChunkCount = ChunkCount,
+            MinChunkCount = MinChunkCount,
+            MaxChunkCount = MaxChunkCount,
+            EnableDynamicConcurrency = EnableDynamicConcurrency,
+            SegmentSize = SegmentSize,
+            MinSegmentSize = MinSegmentSize,
+            MaxSegmentSize = MaxSegmentSize,
+            EnableDynamicSegmentSize = EnableDynamicSegmentSize,
+            AdaptInterval = AdaptInterval,
+            Timeout = Timeout,
+            Proxy = Proxy,
+            UserAgent = UserAgent,
+            BufferSize = BufferSize,
+            MaxRetry = MaxRetry,
+            SlowSegmentMinDuration = SlowSegmentMinDuration,
+            NoDataTimeout = NoDataTimeout,
+            SlowSpeedRatio = SlowSpeedRatio,
+            MinRemainingBytesForRequeue = MinRemainingBytesForRequeue,
+            ProgressIntervalMs = ProgressIntervalMs,
+            SpeedLimitProvider = SpeedLimitProvider,
+            EnableResume = EnableResume,
+            FileConflictPolicy = FileConflictPolicy,
+            TempFileExtension = TempFileExtension,
+            MetadataFileExtension = MetadataFileExtension,
+            IgnoreSslErrors = IgnoreSslErrors
+        };
+    }
 }
