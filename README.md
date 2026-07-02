@@ -13,7 +13,7 @@ dotnet add package LightDl
 Or add it to your `.csproj`:
 
 ```xml
-<PackageReference Include="LightDl" Version="0.2.0" />
+<PackageReference Include="LightDl" Version="0.2.1" />
 ```
 
 ## Usage
@@ -21,12 +21,11 @@ Or add it to your `.csproj`:
 ```csharp
 using LightDl;
 
-using var downloader = new LightDownloader();
 var request = LightDownloadRequest.ToDirectory("https://example.com/file.zip", AppContext.BaseDirectory)
     .OnFileInfo(info => Console.WriteLine($"Downloading {info.FileName} ({info.Size} bytes)"))
     .OnProgress(p => Console.Write($"\r{p.ProgressPercentage:F1}%  {p.Speed / 1024 / 1024:F1} MB/s"));
 
-var result = await downloader.DownloadAsync(request);
+var result = await LightDownload.DownloadAsync(request);
 
 Console.WriteLine($"\nSaved to: {result.FilePath}");
 ```
@@ -34,10 +33,8 @@ Console.WriteLine($"\nSaved to: {result.FilePath}");
 Pass a directory to use the remote file name, or pass a full file path to choose the output name yourself:
 
 ```csharp
-using var downloader = new LightDownloader();
-
-await downloader.DownloadAsync(LightDownloadRequest.ToDirectory(url, @"C:\Downloads\"));
-await downloader.DownloadAsync(LightDownloadRequest.ToFile(url, @"C:\Downloads\custom-name.zip"));
+await LightDownload.DownloadAsync(LightDownloadRequest.ToDirectory(url, @"C:\Downloads\"));
+await LightDownload.DownloadAsync(LightDownloadRequest.ToFile(url, @"C:\Downloads\custom-name.zip"));
 ```
 
 With options:
@@ -50,8 +47,7 @@ var config = new LightDownloadConfig
     FileConflictPolicy = LightDownloadFileConflictPolicy.Rename
 };
 
-using var downloader = new LightDownloader(config);
-await downloader.DownloadAsync(LightDownloadRequest.ToDirectory(url, path));
+await LightDownload.DownloadAsync(LightDownloadRequest.ToDirectory(url, path), config);
 ```
 
 With request headers:
@@ -63,11 +59,17 @@ var headers = new Dictionary<string, string>
     ["Referer"] = "https://example.com/"
 };
 
-using var downloader = new LightDownloader();
-await downloader.DownloadAsync(LightDownloadRequest.ToDirectory(url, path, headers));
+await LightDownload.DownloadAsync(LightDownloadRequest.ToDirectory(url, path, headers));
 ```
 
-UI code can also pass `IProgress<LightDownloadProgress>` and `IProgress<LightDownloadFileInfo>` directly to `DownloadAsync`.
+Parallel downloads:
+
+```csharp
+var results = await Task.WhenAll(urls.Select(url =>
+    LightDownload.DownloadAsync(LightDownloadRequest.ToDirectory(url, @"C:\Downloads\"))));
+```
+
+For advanced scenarios, create a `LightDownloader` instance yourself. Use one instance per active download; concurrent calls on the same instance are rejected.
 
 Resume support is enabled by default. If the download is interrupted, call `DownloadAsync` again with the same request to continue.
 

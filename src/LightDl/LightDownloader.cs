@@ -7,7 +7,7 @@ using System.Text.Json;
 namespace LightDl;
 
 /// <summary>
-/// Lightweight multi-threaded downloader based on HttpClient.
+/// Lightweight multi-threaded downloader based on HttpClient. Use one instance per active download.
 /// </summary>
 public sealed class LightDownloader : IDisposable
 {
@@ -16,6 +16,7 @@ public sealed class LightDownloader : IDisposable
     private readonly LightDownloadConfig _config;
     private readonly HttpClient _http;
     private readonly Lock _metadataLock = new();
+    private int _isDownloading;
     private bool _disposed;
 
     public LightDownloader(LightDownloadConfig? config = null)
@@ -55,7 +56,17 @@ public sealed class LightDownloader : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentNullException.ThrowIfNull(request);
 
-        return await DownloadCoreAsync(request, progress, fileInfo, cancellationToken).ConfigureAwait(false);
+        if (Interlocked.Exchange(ref _isDownloading, 1) == 1)
+            throw new InvalidOperationException("LightDownloader does not support concurrent downloads. Create one LightDownloader per active download or use LightDownload.DownloadAsync.");
+
+        try
+        {
+            return await DownloadCoreAsync(request, progress, fileInfo, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            Volatile.Write(ref _isDownloading, 0);
+        }
     }
 
     /// <summary>
