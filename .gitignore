@@ -4,4 +4,6 @@ artifacts/
 *.user
 *.suo
 .vs/
+.idea/
+.DS_Store
 *.DotSettings.user

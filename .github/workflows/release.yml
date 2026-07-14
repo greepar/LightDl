@@ -1,0 +1,180 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  cli:
+    name: CLI ${{ matrix.rid }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            rid: win-x64
+            executable: LightDl.Cli.exe
+            release_executable: lightdl.exe
+            archive: zip
+            container_build: false
+          - os: windows-11-arm
+            rid: win-arm64
+            executable: LightDl.Cli.exe
+            release_executable: lightdl.exe
+            archive: zip
+            container_build: false
+          - os: windows-latest
+            rid: win-x86
+            executable: LightDl.Cli.exe
+            release_executable: lightdl.exe
+            archive: zip
+            container_build: false
+          - os: ubuntu-24.04
+            rid: linux-x64
+            executable: LightDl.Cli
+            release_executable: lightdl
+            archive: tar
+            container_build: false
+          - os: ubuntu-24.04-arm
+            rid: linux-arm64
+            executable: LightDl.Cli
+            release_executable: lightdl
+            archive: tar
+            container_build: false
+          - os: ubuntu-24.04
+            rid: linux-musl-x64
+            executable: LightDl.Cli
+            release_executable: lightdl
+            archive: tar
+            container_build: true
+          - os: ubuntu-24.04-arm
+            rid: linux-musl-arm64
+            executable: LightDl.Cli
+            release_executable: lightdl
+            archive: tar
+            container_build: true
+          - os: macos-15-intel
+            rid: osx-x64
+            executable: LightDl.Cli
+            release_executable: lightdl
+            archive: tar
+            container_build: false
+          - os: macos-15
+            rid: osx-arm64
+            executable: LightDl.Cli
+            release_executable: lightdl
+            archive: tar
+            container_build: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Install Native AOT dependencies
+        if: runner.os == 'Linux' && ! matrix.container_build
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+
+      - name: Publish Native AOT CLI
+        if: ${{ ! matrix.container_build }}
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          dotnet publish src/LightDl.Cli/LightDl.Cli.csproj \
+            --configuration Release \
+            --runtime "${{ matrix.rid }}" \
+            --output publish \
+            -p:Version="$VERSION" \
+            -p:ContinuousIntegrationBuild=true
+
+      - name: Publish Native AOT CLI with musl
+        if: matrix.container_build
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          docker run --rm \
+            --volume "${GITHUB_WORKSPACE}:/src" \
+            --workdir /src \
+            --env RELEASE_VERSION="$VERSION" \
+            mcr.microsoft.com/dotnet/sdk:10.0-alpine-aot \
+            sh -c 'dotnet publish src/LightDl.Cli/LightDl.Cli.csproj \
+              --configuration Release \
+              --runtime "${{ matrix.rid }}" \
+              --output publish \
+              -p:Version="$RELEASE_VERSION" \
+              -p:ContinuousIntegrationBuild=true && chmod -R a+rwX publish'
+
+      - name: Prepare CLI package
+        shell: bash
+        run: |
+          mkdir package
+          mv "publish/${{ matrix.executable }}" "package/${{ matrix.release_executable }}"
+
+      - name: Create zip archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: Compress-Archive -Path "package/${{ matrix.release_executable }}" -DestinationPath "lightdl-${{ matrix.rid }}.zip"
+
+      - name: Create tar archive
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: tar -czf "lightdl-${{ matrix.rid }}.tar.gz" -C package "${{ matrix.release_executable }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lightdl-${{ matrix.rid }}
+          path: lightdl-${{ matrix.rid }}.*
+          if-no-files-found: error
+
+  nuget:
+    name: NuGet package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Pack NuGet package
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          dotnet pack src/LightDl/LightDl.csproj \
+            --configuration Release \
+            --output packages \
+            -p:Version="$VERSION" \
+            -p:ContinuousIntegrationBuild=true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lightdl-nuget
+          path: packages/*.nupkg
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs:
+      - cli
+      - nuget
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create checksums
+        run: sha256sum release-assets/* > release-assets/SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*

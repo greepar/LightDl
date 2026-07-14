@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/LightDl/LightDl.csproj" />
+  <Project Path="src/LightDl.Cli/LightDl.Cli.csproj" />
+</Solution>

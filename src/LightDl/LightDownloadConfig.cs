@@ -68,8 +68,8 @@ public class LightDownloadConfig
     /// <summary>Enables resume support. Enabled by default.</summary>
     public bool EnableResume { get; set; } = true;
 
-    /// <summary>How to handle an existing destination file. Default is overwrite.</summary>
-    public LightDownloadFileConflictPolicy FileConflictPolicy { get; set; } = LightDownloadFileConflictPolicy.Overwrite;
+    /// <summary>How to handle an existing destination file. Default is rename.</summary>
+    public LightDownloadFileConflictPolicy FileConflictPolicy { get; set; } = LightDownloadFileConflictPolicy.Rename;
 
     /// <summary>Temporary data file extension used for resume support.</summary>
     public string TempFileExtension { get; set; } = ".lightdl";

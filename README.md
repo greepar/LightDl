@@ -13,7 +13,7 @@ dotnet add package LightDl
 Or add it to your `.csproj`:
 
 ```xml
-<PackageReference Include="LightDl" Version="0.2.2" />
+<PackageReference Include="LightDl" Version="0.2.3" />
 ```
 
 ## Usage
@@ -50,12 +50,13 @@ With options:
 var config = new LightDownloadConfig
 {
     ChunkCount = 24,
-    Proxy = new WebProxy("http://127.0.0.1:8080"),
-    FileConflictPolicy = LightDownloadFileConflictPolicy.Rename
+    Proxy = new WebProxy("http://127.0.0.1:8080")
 };
 
 await LightDownload.DownloadAsync(LightDownloadRequest.ToDirectory(url, path), config);
 ```
+
+If the destination file already exists, LightDl renames the new download by default, for example `file (1).zip`. Set `FileConflictPolicy` to `Overwrite`, `Fail`, or `Skip` if you want different behavior.
 
 With request headers:
 
@@ -79,6 +80,44 @@ var results = await Task.WhenAll(urls.Select(url =>
 For advanced scenarios, create a `LightDownloader` instance yourself. Use one instance per active download; concurrent calls on the same instance are rejected.
 
 Resume support is enabled by default. If the download is interrupted, call `DownloadAsync` again with the same request to continue.
+
+## CLI
+
+Download the Native AOT executable for your platform from [GitHub Releases](https://github.com/greepar/LightDl/releases). No .NET runtime installation is required.
+
+Available release targets:
+
+- Windows: `win-x64`, `win-arm64`, `win-x86`
+- Linux glibc: `linux-x64`, `linux-arm64`
+- Linux musl/Alpine: `linux-musl-x64`, `linux-musl-arm64`
+- macOS: `osx-x64`, `osx-arm64`
+
+Download into a directory:
+
+```bash
+lightdl https://example.com/file.zip ./downloads
+```
+
+Download to an exact file path:
+
+```bash
+lightdl https://example.com/file.zip ./downloads/custom.zip --file
+```
+
+Configure workers, conflict handling, or request headers:
+
+```bash
+lightdl https://example.com/file.zip ./downloads \
+  --chunks 8 \
+  --conflict skip \
+  --header "Authorization: Bearer token"
+```
+
+On Windows, use `lightdl.exe`. Run `lightdl --help` to see all options. The default conflict policy is `rename`, so an existing file is not overwritten.
+
+## Releases
+
+Pushing a version tag such as `v0.2.3` runs `.github/workflows/release.yml`. The workflow builds all Native AOT CLI archives, creates `LightDl.0.2.3.nupkg`, generates SHA-256 checksums, and attaches everything to the GitHub Release.
 
 ## License
 
