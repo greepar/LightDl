@@ -24,20 +24,30 @@ public sealed class LightDownloader : IDisposable
         _config = (config ?? new LightDownloadConfig()).Clone();
         NormalizeConfig(_config);
 
-        var handler = new SocketsHttpHandler
+        HttpMessageHandler handler;
+        if (_config.HttpMessageHandlerFactory is not null)
         {
-            MaxConnectionsPerServer = Math.Max(_config.MaxChunkCount, _config.ChunkCount) * 2,
-            PooledConnectionLifetime = TimeSpan.FromMinutes(2),
-            Proxy = _config.Proxy,
-            UseProxy = _config.Proxy != null,
-        };
-
-        if (_config.IgnoreSslErrors)
+            handler = _config.HttpMessageHandlerFactory();
+        }
+        else
         {
-            handler.SslOptions = new SslClientAuthenticationOptions
+            var socketsHandler = new SocketsHttpHandler
             {
-                RemoteCertificateValidationCallback = delegate { return true; }
+                MaxConnectionsPerServer = Math.Max(_config.MaxChunkCount, _config.ChunkCount) * 2,
+                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+                Proxy = _config.Proxy,
+                UseProxy = _config.UseProxy,
             };
+
+            if (_config.IgnoreSslErrors)
+            {
+                socketsHandler.SslOptions = new SslClientAuthenticationOptions
+                {
+                    RemoteCertificateValidationCallback = delegate { return true; }
+                };
+            }
+
+            handler = socketsHandler;
         }
 
         _http = new HttpClient(handler) { Timeout = _config.Timeout };
@@ -262,10 +272,14 @@ public sealed class LightDownloader : IDisposable
                 }, ct);
             }
 
-            await Task.WhenAll(workers).ConfigureAwait(false);
-
-            await progressCts.CancelAsync();
-            try { await progressTask.ConfigureAwait(false); } catch (OperationCanceledException) { }
+            try
+            {
+                await Task.WhenAll(workers).ConfigureAwait(false);
+            }
+            finally
+            {
+                await StopProgressReportingAsync(progressCts, progressTask).ConfigureAwait(false);
+            }
 
             stopwatch.Stop();
             if (!_config.EnableResume) return CreateDownloadResult(info, destinationPath);
@@ -403,6 +417,9 @@ public sealed class LightDownloader : IDisposable
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            if (currentOffset > lastCommittedOffset)
+                onRangeCompleted(lastCommittedOffset, currentOffset - 1);
+
             throw;
         }
         catch (Exception ex)
@@ -433,28 +450,43 @@ public sealed class LightDownloader : IDisposable
 
         using var progressCts = new CancellationTokenSource();
         var progressTask = ReportProgressOnlyLoop(progressCts.Token, downloaded.Read, totalLength, progressChanged);
-
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        ApplyHeaders(request, headers);
-        using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
-
-        await using var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-        await using var dest = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None,
-            _config.BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
-
-        var buffer = new byte[_config.BufferSize];
-        int read;
-        while ((read = await source.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
+        try
         {
-            await dest.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-            downloaded.Add(read);
-            await ApplySpeedLimitAsync(downloaded.Read(), sw, ct).ConfigureAwait(false);
-        }
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            ApplyHeaders(request, headers);
+            using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
 
-        await progressCts.CancelAsync();
-        try { await progressTask.ConfigureAwait(false); } catch (OperationCanceledException) { }
-        sw.Stop();
+            await using var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            await using var dest = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None,
+                _config.BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+
+            var buffer = new byte[_config.BufferSize];
+            int read;
+            while ((read = await source.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
+            {
+                await dest.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                downloaded.Add(read);
+                await ApplySpeedLimitAsync(downloaded.Read(), sw, ct).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            await StopProgressReportingAsync(progressCts, progressTask).ConfigureAwait(false);
+            sw.Stop();
+        }
+    }
+
+    private static async Task StopProgressReportingAsync(CancellationTokenSource cancellation, Task progressTask)
+    {
+        await cancellation.CancelAsync().ConfigureAwait(false);
+        try
+        {
+            await progressTask.ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+        }
     }
 
     private async Task ReportProgressOnlyLoop(CancellationToken ct, Func<long> getDownloaded, long total, Action<LightDownloadProgress>? progressChanged)

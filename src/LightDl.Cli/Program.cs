@@ -70,7 +70,8 @@ static async Task<int> RunAsync(string[] args)
 
     try
     {
-        var result = await LightDownload.DownloadAsync(request, config, cancellation.Token);
+        using var downloader = new LightDownloader(config);
+        var result = await downloader.DownloadAsync(request, cancellation.Token);
         if (lastProgressLength > 0)
             Console.WriteLine();
 

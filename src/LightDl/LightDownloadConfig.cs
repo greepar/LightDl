@@ -35,8 +35,14 @@ public class LightDownloadConfig
     /// <summary>HTTP request timeout. Default is 30 seconds.</summary>
     public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(30);
 
-    /// <summary>HTTP proxy. Null means direct connection.</summary>
+    /// <summary>Explicit HTTP proxy. Null uses the system proxy when <see cref="UseProxy" /> is enabled.</summary>
     public System.Net.IWebProxy? Proxy { get; set; }
+
+    /// <summary>Enables proxy resolution. When enabled with a null proxy, the system proxy is used.</summary>
+    public bool UseProxy { get; set; }
+
+    /// <summary>Optional platform-specific HTTP message handler factory.</summary>
+    public Func<HttpMessageHandler>? HttpMessageHandlerFactory { get; set; }
 
     /// <summary>User-Agent header. Defaults to a Chrome-like UA.</summary>
     public string UserAgent { get; set; } = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0";
@@ -95,6 +101,8 @@ public class LightDownloadConfig
             AdaptInterval = AdaptInterval,
             Timeout = Timeout,
             Proxy = Proxy,
+            UseProxy = UseProxy,
+            HttpMessageHandlerFactory = HttpMessageHandlerFactory,
             UserAgent = UserAgent,
             BufferSize = BufferSize,
             MaxRetry = MaxRetry,
