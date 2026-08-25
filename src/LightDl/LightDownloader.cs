@@ -205,28 +205,36 @@ public sealed class LightDownloader : IDisposable
         try
         {
             long finalSize;
+            long transferredBytes;
+            var transferStopwatch = Stopwatch.StartNew();
             if (ranged)
             {
-                await DownloadRangedAsync(downloadTarget, tempPath, metadataPath, urlString, totalLength, probe,
-                    progressChanged, ct).ConfigureAwait(false);
+                transferredBytes = await DownloadRangedAsync(downloadTarget, tempPath, metadataPath, urlString,
+                    totalLength, probe, progressChanged, ct).ConfigureAwait(false);
                 finalSize = totalLength;
             }
             else
             {
                 finalSize = await DownloadSingleStreamAsync(downloadTarget, tempPath, totalLength, progressChanged, ct)
                     .ConfigureAwait(false);
+                transferredBytes = finalSize;
             }
+
+            transferStopwatch.Stop();
 
             await VerifyChecksumAsync(tempPath, ct).ConfigureAwait(false);
 
             File.Move(tempPath, destinationPath, overwrite: true);
             DeleteIfExists(metadataPath);
 
+            // Reporting 0 at 100% reads as "stalled". The average over what this run actually
+            // transferred is both truthful and the number a caller wants to show.
+            var transferSeconds = transferStopwatch.Elapsed.TotalSeconds;
             progressChanged?.Invoke(new LightDownloadProgress
             {
                 DownloadedBytes = finalSize,
                 TotalBytes = finalSize,
-                Speed = 0
+                Speed = transferSeconds > 0 ? transferredBytes / transferSeconds : 0
             });
             return CreateDownloadResult(info, destinationPath, size: finalSize);
         }
@@ -244,7 +252,7 @@ public sealed class LightDownloader : IDisposable
         }
     }
 
-    private async Task DownloadRangedAsync(
+    private async Task<long> DownloadRangedAsync(
         DownloadTarget downloadTarget,
         string tempPath,
         string metadataPath,
@@ -398,6 +406,8 @@ public sealed class LightDownloader : IDisposable
             ForceSaveMetadata(metadata, metadataPath);
             throw;
         }
+
+        return sessionDownloaded.Read();
     }
 
     private async Task<long> DownloadSingleStreamAsync(

@@ -518,4 +518,24 @@ public sealed class DownloadTests : IDisposable
 
         Assert.Contains("stalled", error.Message, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public async Task The_Final_Progress_Report_Carries_The_Average_Speed()
+    {
+        var origin = new FakeOrigin(MakeContent(2 * 1024 * 1024)) { BodyDelay = TimeSpan.FromMilliseconds(5) };
+        var reported = new List<LightDownloadProgress>();
+
+        using var downloader = new LightDownloader(BaseConfig(origin));
+        var request = LightDownloadRequest.ToFile(Url, Path("out.bin"))
+            .OnProgress(p =>
+            {
+                lock (reported) reported.Add(p);
+            });
+        await downloader.DownloadAsync(request);
+
+        var final = reported[^1];
+        Assert.Equal(100d, final.ProgressPercentage, 5);
+        // 0 B/s at 100% reads as a stall; the last report must carry a real rate.
+        Assert.True(final.Speed > 0, $"final progress reported {final.Speed} B/s");
+    }
 }
