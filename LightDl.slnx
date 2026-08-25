@@ -1,4 +1,5 @@
 <Solution>
   <Project Path="src/LightDl/LightDl.csproj" />
   <Project Path="src/LightDl.Cli/LightDl.Cli.csproj" />
+  <Project Path="tests/LightDl.Tests/LightDl.Tests.csproj" />
 </Solution>

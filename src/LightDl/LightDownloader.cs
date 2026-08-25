@@ -1,7 +1,13 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
+using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Security;
+using System.Runtime.ExceptionServices;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 
 namespace LightDl;
@@ -11,13 +17,24 @@ namespace LightDl;
 /// </summary>
 public sealed class LightDownloader : IDisposable
 {
+    /// <summary>Reported as <see cref="LightDownloadFileInfo.Size" /> when the server does not declare a length.</summary>
+    public const long UnknownSize = -1;
+
     private const long MetadataFlushBytes = 4L * 1024 * 1024;
+    private const int MaxRedirects = 10;
+    private const int MaxFileNameBytes = 255;
+    private const string DefaultFileName = "download";
+    private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
     private readonly LightDownloadConfig _config;
     private readonly HttpClient _http;
     private readonly Lock _metadataLock = new();
+    private readonly Lock _metadataFileLock = new();
+    private long _metadataVersion;
+    private long _metadataWrittenVersion;
+    private long _lastMetadataSaveTimestamp;
     private int _isDownloading;
-    private bool _disposed;
+    private int _disposed;
 
     public LightDownloader(LightDownloadConfig? config = null)
     {
@@ -28,11 +45,18 @@ public sealed class LightDownloader : IDisposable
         if (_config.HttpMessageHandlerFactory is not null)
         {
             handler = _config.HttpMessageHandlerFactory();
+            ValidateHandler(handler);
         }
         else
         {
             var socketsHandler = new SocketsHttpHandler
             {
+                AllowAutoRedirect = false,
+                AutomaticDecompression = DecompressionMethods.None,
+                // Redirects and the Cookie header are handled here; letting the handler add its own
+                // cookies on top would duplicate or override caller-supplied credentials.
+                UseCookies = false,
+                ConnectTimeout = _config.ConnectTimeout,
                 MaxConnectionsPerServer = Math.Max(_config.MaxChunkCount, _config.ChunkCount) * 2,
                 PooledConnectionLifetime = TimeSpan.FromMinutes(2),
                 Proxy = _config.Proxy,
@@ -51,7 +75,8 @@ public sealed class LightDownloader : IDisposable
         }
 
         _http = new HttpClient(handler) { Timeout = _config.Timeout };
-        _http.DefaultRequestHeaders.UserAgent.ParseAdd(_config.UserAgent);
+        if (!_http.DefaultRequestHeaders.UserAgent.TryParseAdd(_config.UserAgent))
+            _http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", _config.UserAgent);
     }
 
     /// <summary>
@@ -63,11 +88,12 @@ public sealed class LightDownloader : IDisposable
         IProgress<LightDownloadFileInfo>? fileInfo = null,
         CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) == 1, this);
         ArgumentNullException.ThrowIfNull(request);
 
         if (Interlocked.Exchange(ref _isDownloading, 1) == 1)
-            throw new InvalidOperationException("LightDownloader does not support concurrent downloads. Create one LightDownloader per active download or use LightDownload.DownloadAsync.");
+            throw new InvalidOperationException(
+                "LightDownloader does not support concurrent downloads. Create one LightDownloader per active download.");
 
         try
         {
@@ -96,7 +122,8 @@ public sealed class LightDownloader : IDisposable
         IProgress<LightDownloadProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        return DownloadAsync(LightDownloadRequest.ToFile(url, filePath), progress, cancellationToken: cancellationToken);
+        return DownloadAsync(LightDownloadRequest.ToFile(url, filePath), progress,
+            cancellationToken: cancellationToken);
     }
 
     /// <summary>
@@ -108,7 +135,8 @@ public sealed class LightDownloader : IDisposable
         IProgress<LightDownloadProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        return DownloadAsync(LightDownloadRequest.ToFile(url, filePath), progress, cancellationToken: cancellationToken);
+        return DownloadAsync(LightDownloadRequest.ToFile(url, filePath), progress,
+            cancellationToken: cancellationToken);
     }
 
     /// <summary>
@@ -120,7 +148,8 @@ public sealed class LightDownloader : IDisposable
         IProgress<LightDownloadProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        return DownloadAsync(LightDownloadRequest.ToDirectory(url, directoryPath), progress, cancellationToken: cancellationToken);
+        return DownloadAsync(LightDownloadRequest.ToDirectory(url, directoryPath), progress,
+            cancellationToken: cancellationToken);
     }
 
     /// <summary>
@@ -132,7 +161,8 @@ public sealed class LightDownloader : IDisposable
         IProgress<LightDownloadProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        return DownloadAsync(LightDownloadRequest.ToDirectory(url, directoryPath), progress, cancellationToken: cancellationToken);
+        return DownloadAsync(LightDownloadRequest.ToDirectory(url, directoryPath), progress,
+            cancellationToken: cancellationToken);
     }
 
     private async Task<LightDownloadResult> DownloadCoreAsync(
@@ -144,18 +174,17 @@ public sealed class LightDownloader : IDisposable
         var url = request.RequestUri;
         var urlString = request.Url;
         var headers = request.Headers;
-        var info = await ProbeFileInfoAsync(url, headers, ct).ConfigureAwait(false);
-        fileInfo?.Report(info);
-        request.FileInfoHandler?.Invoke(info);
-        Action<LightDownloadProgress>? progressChanged = progress is null && request.ProgressHandler is null
-            ? null
-            : value =>
-            {
-                progress?.Report(value);
-                request.ProgressHandler?.Invoke(value);
-            };
-        var totalLength = info.Size;
-        var destinationPath = ResolveDestinationPath(request.DestinationPath, info.FileName, request.DestinationKind);
+        var probe = await ProbeFileInfoAsync(url, headers, ct).ConfigureAwait(false);
+        var downloadTarget = new DownloadTarget(url, probe.DownloadUri, headers);
+        var progressChanged = BuildProgressReporter(progress, request);
+
+        var totalLength = probe.Size;
+        var destinationPath = ResolveDestinationPath(request.DestinationPath, probe.FileName, request.DestinationKind);
+
+        var info = probe.CreateFileInfo(destinationPath);
+        SafeInvoke(() => fileInfo?.Report(info));
+        SafeInvoke(() => request.FileInfoHandler?.Invoke(info));
+
         if (TryHandleExistingFile(info, ref destinationPath, out var skippedResult))
         {
             progressChanged?.Invoke(new LightDownloadProgress
@@ -167,183 +196,381 @@ public sealed class LightDownloader : IDisposable
             return skippedResult;
         }
 
-        if (!info.SupportsRange)
-        {
-            try
-            {
-                await DownloadSingleThreadAsync(url, destinationPath, totalLength, headers, progressChanged, ct).ConfigureAwait(false);
-                return CreateDownloadResult(info, destinationPath);
-            }
-            catch
-            {
-                if (!_config.EnableResume)
-                    DeleteIfExists(destinationPath);
+        // Every path writes to a temporary file and is renamed on success, so a failed download can
+        // never leave a truncated file sitting at the destination name.
+        var ranged = info.SupportsRange && totalLength >= 0;
+        var tempPath = destinationPath + _config.TempFileExtension;
+        var metadataPath = ResolveMetadataPath(destinationPath);
 
-                throw;
-            }
-        }
-
-        var tempPath = _config.EnableResume ? destinationPath + _config.TempFileExtension : destinationPath;
-        var metadataPath = destinationPath + _config.MetadataFileExtension;
         try
         {
-            var metadata = LoadOrCreateMetadata(urlString, totalLength, tempPath, metadataPath);
-            var completedRanges = MergeRanges(metadata.CompletedRanges.Select(r => new DownloadRange(r.Start, r.End)).ToList());
-
-            Preallocate(tempPath, totalLength);
-
-            var allocator = new RangeAllocator(BuildMissingRanges(totalLength, completedRanges));
-            var retryQueue = new ConcurrentQueue<DownloadSegment>();
-            var activeSegments = 0;
-            var downloaded = new AtomicLong(completedRanges.Sum(r => r.End - r.Start + 1));
-            var currentConcurrency = Math.Min(_config.ChunkCount, _config.MaxChunkCount);
-            var currentSegmentSize = CalculateStableSegmentSize(totalLength, currentConcurrency);
-            var stopwatch = Stopwatch.StartNew();
-
-            using var progressCts = new CancellationTokenSource();
-            var progressTask = ReportProgressAndAdaptLoop(
-                progressCts.Token,
-                downloaded.Read,
-                totalLength,
-                progressChanged,
-                () => Volatile.Read(ref currentConcurrency),
-                value => Volatile.Write(ref currentConcurrency, value),
-                () => Interlocked.Read(ref currentSegmentSize),
-                value => Interlocked.Exchange(ref currentSegmentSize, value));
-
-            var workerCount = _config.EnableDynamicConcurrency ? _config.MaxChunkCount : _config.ChunkCount;
-            var workers = new Task[workerCount];
-            for (var workerIndex = 0; workerIndex < workerCount; workerIndex++)
+            long finalSize;
+            if (ranged)
             {
-                var index = workerIndex;
-                workers[index] = Task.Run(async () =>
-                {
-                    while (true)
-                    {
-                        ct.ThrowIfCancellationRequested();
-
-                        if (index >= Volatile.Read(ref currentConcurrency))
-                        {
-                            if (allocator.IsEmpty && retryQueue.IsEmpty && Volatile.Read(ref activeSegments) == 0)
-                                break;
-
-                            await Task.Delay(100, ct).ConfigureAwait(false);
-                            continue;
-                        }
-
-                        if (!retryQueue.TryDequeue(out var segment) && !allocator.TryRent(Interlocked.Read(ref currentSegmentSize), out segment))
-                        {
-                            if (Volatile.Read(ref activeSegments) == 0)
-                                break;
-
-                            await Task.Delay(100, ct).ConfigureAwait(false);
-                            continue;
-                        }
-
-                        Interlocked.Increment(ref activeSegments);
-                        try
-                        {
-                            await DownloadChunkAsync(url, tempPath, segment.Start, segment.End,
-                                downloaded.Add,
-                                downloaded.Read, totalLength, stopwatch, headers,
-                                (rangeStart, rangeEnd) => AddCompletedRange(metadata, metadataPath, rangeStart, rangeEnd),
-                                ct).ConfigureAwait(false);
-                        }
-                        catch (SegmentRetryException ex) when (segment.RetryCount < _config.MaxRetry)
-                        {
-                            if (ex.NextStart > segment.Start)
-                                AddCompletedRange(metadata, metadataPath, segment.Start, Math.Min(ex.NextStart - 1, segment.End));
-
-                            if (ex.NextStart <= segment.End)
-                                retryQueue.Enqueue(new DownloadSegment(ex.NextStart, segment.End, segment.RetryCount + 1));
-
-                            await Task.Delay(500 * (segment.RetryCount + 1), ct).ConfigureAwait(false);
-                        }
-                        catch (Exception) when (segment.RetryCount < _config.MaxRetry)
-                        {
-                            retryQueue.Enqueue(new DownloadSegment(segment.Start, segment.End, segment.RetryCount + 1));
-                            await Task.Delay(500 * (segment.RetryCount + 1), ct).ConfigureAwait(false);
-                        }
-                        finally
-                        {
-                            Interlocked.Decrement(ref activeSegments);
-                        }
-                    }
-                }, ct);
+                await DownloadRangedAsync(downloadTarget, tempPath, metadataPath, urlString, totalLength, probe,
+                    progressChanged, ct).ConfigureAwait(false);
+                finalSize = totalLength;
+            }
+            else
+            {
+                finalSize = await DownloadSingleStreamAsync(downloadTarget, tempPath, totalLength, progressChanged, ct)
+                    .ConfigureAwait(false);
             }
 
+            await VerifyChecksumAsync(tempPath, ct).ConfigureAwait(false);
+
+            File.Move(tempPath, destinationPath, overwrite: true);
+            DeleteIfExists(metadataPath);
+
+            progressChanged?.Invoke(new LightDownloadProgress
+            {
+                DownloadedBytes = finalSize,
+                TotalBytes = finalSize,
+                Speed = 0
+            });
+            return CreateDownloadResult(info, destinationPath, size: finalSize);
+        }
+        catch (Exception ex)
+        {
+            // Partial data is only worth keeping when it can actually be resumed and is still valid.
+            var resumable = ranged && _config.EnableResume && !IsPartialDataInvalid(ex);
+            if (!resumable)
+            {
+                DeleteIfExists(tempPath);
+                DeleteIfExists(metadataPath);
+            }
+
+            throw Rethrow(ex);
+        }
+    }
+
+    private async Task DownloadRangedAsync(
+        DownloadTarget downloadTarget,
+        string tempPath,
+        string metadataPath,
+        string urlString,
+        long totalLength,
+        ProbeResult probe,
+        Action<LightDownloadProgress>? progressChanged,
+        CancellationToken ct)
+    {
+        var metadata = LoadOrCreateMetadata(urlString, totalLength, probe, tempPath, metadataPath);
+        metadata.CompletedRanges = MergeRanges(metadata.CompletedRanges);
+        var completedBytes = metadata.CompletedRanges.Sum(r => r.End - r.Start + 1);
+
+        EnsureFreeSpace(tempPath, totalLength - completedBytes);
+        Preallocate(tempPath, totalLength);
+
+        var allocator = new RangeAllocator(BuildMissingRanges(totalLength, metadata.CompletedRanges));
+        var retryQueue = new ConcurrentQueue<DownloadSegment>();
+        var activeSegments = 0;
+        var downloaded = new AtomicLong(completedBytes);
+        var sessionDownloaded = new AtomicLong();
+        var currentConcurrency = Math.Min(_config.ChunkCount, _config.MaxChunkCount);
+        var currentSegmentSize = CalculateStableSegmentSize(totalLength, currentConcurrency);
+        var stopwatch = Stopwatch.StartNew();
+        var failure = new FailureState();
+
+        // A segment that fails for good must stop the whole download immediately: without this the
+        // remaining workers keep pulling bytes for a download that is already doomed.
+        using var failureCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var linkedCt = failureCts.Token;
+
+        using var progressCts = new CancellationTokenSource();
+        var progressTask = ReportProgressAndAdaptLoop(
+            progressCts.Token,
+            downloaded.Read,
+            totalLength,
+            progressChanged,
+            () => Volatile.Read(ref currentConcurrency),
+            value => Volatile.Write(ref currentConcurrency, value),
+            () => Interlocked.Read(ref currentSegmentSize),
+            value => Interlocked.Exchange(ref currentSegmentSize, value));
+
+        var workerCount = _config.EnableDynamicConcurrency ? _config.MaxChunkCount : _config.ChunkCount;
+        var workers = new Task[workerCount];
+        for (var workerIndex = 0; workerIndex < workerCount; workerIndex++)
+        {
+            var index = workerIndex;
+            workers[index] = Task.Run(async () =>
+            {
+                while (true)
+                {
+                    linkedCt.ThrowIfCancellationRequested();
+
+                    if (index >= Volatile.Read(ref currentConcurrency))
+                    {
+                        if (allocator.IsEmpty && retryQueue.IsEmpty && Volatile.Read(ref activeSegments) == 0)
+                            break;
+
+                        await Task.Delay(100, linkedCt).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    if (!retryQueue.TryDequeue(out var segment) &&
+                        !allocator.TryRent(Interlocked.Read(ref currentSegmentSize), out segment))
+                    {
+                        if (Volatile.Read(ref activeSegments) == 0)
+                            break;
+
+                        await Task.Delay(100, linkedCt).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    Interlocked.Increment(ref activeSegments);
+                    try
+                    {
+                        await DownloadChunkAsync(downloadTarget, tempPath, segment.Start, segment.End,
+                            bytes =>
+                            {
+                                downloaded.Add(bytes);
+                                sessionDownloaded.Add(bytes);
+                            },
+                            sessionDownloaded.Read,
+                            () => Volatile.Read(ref activeSegments),
+                            totalLength, stopwatch, probe.IfRange,
+                            (rangeStart, rangeEnd) => AddCompletedRange(metadata, metadataPath, rangeStart, rangeEnd),
+                            linkedCt).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (linkedCt.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        var nextStart = ex is SegmentRetryException retry ? retry.NextStart : segment.Start;
+                        if (nextStart > segment.Start)
+                            AddCompletedRange(metadata, metadataPath, segment.Start,
+                                Math.Min(nextStart - 1, segment.End));
+
+                        if (!IsRetryable(ex) || segment.RetryCount >= _config.MaxRetry)
+                        {
+                            if (failure.TrySet(ex))
+                                await failureCts.CancelAsync();
+
+                            throw;
+                        }
+
+                        if (nextStart <= segment.End)
+                            retryQueue.Enqueue(new DownloadSegment(nextStart, segment.End, segment.RetryCount + 1));
+
+                        var delay = GetRetryDelay(segment.RetryCount, (ex as SegmentRetryException)?.RetryAfter);
+                        NotifyRetry(segment.Start, segment.End, segment.RetryCount + 1, delay, ex);
+                        await Task.Delay(delay, linkedCt).ConfigureAwait(false);
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref activeSegments);
+                    }
+                }
+            }, linkedCt);
+        }
+
+        try
+        {
             try
             {
                 await Task.WhenAll(workers).ConfigureAwait(false);
             }
+            catch
+            {
+                // A worker's fatal error is the real cause; every other worker just observed the
+                // cancellation it triggered.
+                failure.ThrowIfFailed();
+                throw;
+            }
             finally
             {
                 await StopProgressReportingAsync(progressCts, progressTask).ConfigureAwait(false);
+                stopwatch.Stop();
             }
 
-            stopwatch.Stop();
-            if (!_config.EnableResume) return CreateDownloadResult(info, destinationPath);
-            if (File.Exists(destinationPath))
-                File.Delete(destinationPath);
-
-            File.Move(tempPath, destinationPath);
-            if (File.Exists(metadataPath))
-                File.Delete(metadataPath);
-
-            return CreateDownloadResult(info, destinationPath);
+            EnsureAllRangesComplete(metadata, totalLength);
         }
         catch
         {
-            if (!_config.EnableResume)
-                DeletePartialFiles(destinationPath, tempPath, metadataPath);
-
+            ForceSaveMetadata(metadata, metadataPath);
             throw;
         }
     }
 
-    private async Task<LightDownloadFileInfo> ProbeFileInfoAsync(Uri url, IReadOnlyDictionary<string, string>? headers, CancellationToken ct)
+    private async Task<long> DownloadSingleStreamAsync(
+        DownloadTarget target,
+        string tempPath,
+        long totalLength,
+        Action<LightDownloadProgress>? progressChanged,
+        CancellationToken ct)
     {
-        using var request = new HttpRequestMessage(HttpMethod.Get, url);
-        request.Headers.Range = new RangeHeaderValue(0, 0);
-        ApplyHeaders(request, headers);
+        EnsureFreeSpace(tempPath, totalLength);
 
-        using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-        response.EnsureSuccessStatusCode();
+        for (var attempt = 0;; attempt++)
+        {
+            var downloaded = new AtomicLong();
+            var sw = Stopwatch.StartNew();
+            using var progressCts = new CancellationTokenSource();
+            var progressTask = ReportProgressOnlyLoop(progressCts.Token, downloaded.Read, totalLength, progressChanged);
+            try
+            {
+                using var response = await SendRequestAsync(target, ct).ConfigureAwait(false);
 
-        var supportsRange = response.StatusCode == System.Net.HttpStatusCode.PartialContent;
-        long size;
-        if (supportsRange && response.Content.Headers.ContentRange is { Length: { } len })
-        {
-            size = len;
-        }
-        else if (response.Content.Headers.ContentLength is { } cl)
-        {
-            size = cl;
-        }
-        else
-        {
-            throw new InvalidOperationException("The server did not return the file size, so chunked download cannot continue.");
-        }
+                await using var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+                await using (var dest = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.Read,
+                                 bufferSize: 1, FileOptions.Asynchronous | FileOptions.SequentialScan))
+                {
+                    var buffer = ArrayPool<byte>.Shared.Rent(_config.BufferSize);
+                    try
+                    {
+                        while (true)
+                        {
+                            var read = await ReadWithStallTimeoutAsync(source, buffer, 0, ct).ConfigureAwait(false);
+                            if (read == 0)
+                                break;
 
-        return new LightDownloadFileInfo
+                            await WriteAsync(dest, buffer, read, tempPath, ct).ConfigureAwait(false);
+                            downloaded.Add(read);
+                            await ApplySpeedLimitAsync(downloaded.Read(), sw, ct).ConfigureAwait(false);
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
+                    }
+                }
+
+                var received = downloaded.Read();
+                if (totalLength >= 0 && received != totalLength)
+                    throw new SegmentRetryException(0,
+                        $"the server announced {totalLength} bytes but sent {received}.");
+
+                return received;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex) when (IsRetryable(ex) && attempt < _config.MaxRetry)
+            {
+                var delay = GetRetryDelay(attempt, (ex as SegmentRetryException)?.RetryAfter);
+                NotifyRetry(0, totalLength - 1, attempt + 1, delay, ex);
+                await Task.Delay(delay, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                await StopProgressReportingAsync(progressCts, progressTask).ConfigureAwait(false);
+                sw.Stop();
+            }
+        }
+    }
+
+    private async Task<ProbeResult> ProbeFileInfoAsync(Uri url, IReadOnlyDictionary<string, string>? headers,
+        CancellationToken ct)
+    {
+        // The probe is a network request like any other: a transient failure here must not sink a
+        // download that the retry budget could easily have saved.
+        for (var attempt = 0;; attempt++)
         {
-            FileName = GetFileName(response.RequestMessage?.RequestUri ?? url, response),
-            Size = size,
-            ContentType = response.Content.Headers.ContentType?.ToString(),
-            SupportsRange = supportsRange,
-        };
+            try
+            {
+                return await ProbeOnceAsync(url, headers, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                if (!IsRetryable(ex) || attempt >= _config.MaxRetry)
+                    throw Rethrow(ex);
+
+                var delay = GetRetryDelay(attempt, (ex as SegmentRetryException)?.RetryAfter);
+                NotifyRetry(0, -1, attempt + 1, delay, ex);
+                await Task.Delay(delay, ct).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task<ProbeResult> ProbeOnceAsync(Uri url, IReadOnlyDictionary<string, string>? headers,
+        CancellationToken ct)
+    {
+        var response = await SendWithRedirectsAsync(url, headers, new RangeHeaderValue(0, 0), ifRange: null, ct)
+            .ConfigureAwait(false);
+        try
+        {
+            // Some servers reject a range probe outright; a plain GET still works for them.
+            if (response.StatusCode is HttpStatusCode.RequestedRangeNotSatisfiable
+                or HttpStatusCode.MethodNotAllowed
+                or HttpStatusCode.NotImplemented)
+            {
+                response.Dispose();
+                response = await SendWithRedirectsAsync(url, headers, range: null, ifRange: null, ct)
+                    .ConfigureAwait(false);
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var statusCode = response.StatusCode;
+                var retryAfter = GetRetryAfter(response);
+                if (IsRetryableStatus(statusCode))
+                    throw new SegmentRetryException(0,
+                        $"the server answered {(int)statusCode} {statusCode} to the initial request.", retryAfter);
+
+                throw new FatalDownloadException(
+                    $"The server answered {(int)statusCode} {statusCode} to the initial request.");
+            }
+
+            var declinesRanges = response.Headers.AcceptRanges
+                .Any(value => string.Equals(value, "none", StringComparison.OrdinalIgnoreCase));
+
+            long size;
+            bool supportsRange;
+            if (response is { StatusCode: HttpStatusCode.PartialContent, Content.Headers.ContentRange.Length: { } length })
+            {
+                size = length;
+                supportsRange = !declinesRanges;
+            }
+            else
+            {
+                size = response.Content.Headers.ContentLength ?? UnknownSize;
+                supportsRange = false;
+            }
+
+            if (size < 0)
+                supportsRange = false;
+
+            var downloadUri = response.RequestMessage?.RequestUri ?? url;
+            var eTag = response.Headers.ETag;
+            var lastModified = response.Content.Headers.LastModified?
+                .ToUniversalTime()
+                .ToString("R", CultureInfo.InvariantCulture);
+
+            return new ProbeResult(
+                GetFileName(downloadUri, response),
+                size,
+                response.Content.Headers.ContentType?.ToString(),
+                supportsRange,
+                downloadUri,
+                eTag?.ToString(),
+                // A weak validator must not be used for If-Range; it only proves semantic equivalence.
+                eTag is { IsWeak: false } ? eTag.ToString() : lastModified,
+                lastModified);
+        }
+        finally
+        {
+            response.Dispose();
+        }
     }
 
     private async Task DownloadChunkAsync(
-        Uri url,
+        DownloadTarget target,
         string path,
         long start,
         long end,
         Action<long> onBytesReceived,
-        Func<long> getGlobalDownloaded,
+        Func<long> getSessionDownloaded,
+        Func<int> getActiveSegmentCount,
         long totalLength,
         Stopwatch globalStopwatch,
-        IReadOnlyDictionary<string, string>? headers,
+        string? ifRange,
         Action<long, long> onRangeCompleted,
         CancellationToken ct)
     {
@@ -351,72 +578,73 @@ public sealed class LightDownloader : IDisposable
         var lastCommittedOffset = start;
         var segmentBytes = 0L;
         var segmentStopwatch = Stopwatch.StartNew();
+        var buffer = ArrayPool<byte>.Shared.Rent(_config.BufferSize);
 
         try
         {
-            using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            request.Headers.Range = new RangeHeaderValue(start, end);
-            ApplyHeaders(request, headers);
-
-            using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-            if (response.StatusCode != System.Net.HttpStatusCode.PartialContent)
-                throw new SegmentRetryException(start, $"The chunk request did not return 206 Partial Content (actual: {response.StatusCode}). Range requests may not be supported.");
-
-            response.EnsureSuccessStatusCode();
-            ValidateContentRange(response.Content.Headers.ContentRange, start, end, totalLength);
+            using var response = await SendRangeRequestAsync(target, start, end, totalLength, ifRange, ct)
+                .ConfigureAwait(false);
 
             await using var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            await using var dest = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.Write,
-                _config.BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            await using var dest = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite,
+                bufferSize: 1, FileOptions.Asynchronous);
 
             dest.Seek(start, SeekOrigin.Begin);
 
-            var buffer = new byte[_config.BufferSize];
-            while (true)
+            while (currentOffset <= end)
             {
-                using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                readCts.CancelAfter(_config.NoDataTimeout);
-
-                int read;
-                try
-                {
-                    read = await source.ReadAsync(buffer, readCts.Token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-                {
-                    throw new SegmentRetryException(currentOffset, "The connection received no data for too long and will be requeued.");
-                }
-
+                var read = await ReadWithStallTimeoutAsync(source, buffer, currentOffset, ct).ConfigureAwait(false);
                 if (read == 0)
                     break;
 
-                await dest.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                currentOffset += read;
-                segmentBytes += read;
-                onBytesReceived(read);
+                // Never write past the requested range, whatever the server decides to send.
+                var writable = (int)Math.Min(read, end - currentOffset + 1);
+                await WriteAsync(dest, buffer, writable, path, ct).ConfigureAwait(false);
+                currentOffset += writable;
+                segmentBytes += writable;
+                onBytesReceived(writable);
 
                 if (currentOffset - lastCommittedOffset >= MetadataFlushBytes)
                 {
+                    await FlushAsync(dest, ct).ConfigureAwait(false);
                     onRangeCompleted(lastCommittedOffset, currentOffset - 1);
                     lastCommittedOffset = currentOffset;
                 }
 
-                await ApplySpeedLimitAsync(getGlobalDownloaded(), globalStopwatch, ct).ConfigureAwait(false);
+                await ApplySpeedLimitAsync(getSessionDownloaded(), globalStopwatch, ct).ConfigureAwait(false);
 
                 var remainingBytes = end - currentOffset + 1;
-                if (remainingBytes >= _config.MinRemainingBytesForRequeue && IsSlowSegment(segmentBytes, segmentStopwatch, getGlobalDownloaded, globalStopwatch))
-                    throw new SegmentRetryException(currentOffset, "The connection is much slower than the global average and will be requeued.");
+                if (remainingBytes >= _config.MinRemainingBytesForRequeue &&
+                    IsSlowSegment(segmentBytes, segmentStopwatch, getSessionDownloaded, getActiveSegmentCount,
+                        globalStopwatch))
+                    throw new SegmentRetryException(currentOffset,
+                        "the connection is much slower than the global average and will be requeued.");
             }
 
             if (currentOffset > lastCommittedOffset)
+            {
+                await FlushAsync(dest, ct).ConfigureAwait(false);
                 onRangeCompleted(lastCommittedOffset, currentOffset - 1);
+                lastCommittedOffset = currentOffset;
+            }
+
+            // A clean EOF before the end of the range still means the range is incomplete.
+            if (currentOffset <= end)
+                throw new SegmentRetryException(currentOffset,
+                    $"the server closed the connection {end - currentOffset + 1} byte(s) before the end of the range.");
         }
         catch (SegmentRetryException)
         {
             throw;
         }
+        catch (FatalDownloadException)
+        {
+            throw;
+        }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            // Bytes already handed to the OS survive a process crash, so recording them is safe and
+            // saves re-downloading them after a cancel/resume cycle.
             if (currentOffset > lastCommittedOffset)
                 onRangeCompleted(lastCommittedOffset, currentOffset - 1);
 
@@ -424,11 +652,59 @@ public sealed class LightDownloader : IDisposable
         }
         catch (Exception ex)
         {
-            throw new SegmentRetryException(currentOffset, "The segment download failed and will be requeued.", ex);
+            throw new SegmentRetryException(currentOffset, "the segment download failed.", ex);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
-    private bool IsSlowSegment(long segmentBytes, Stopwatch segmentStopwatch, Func<long> getGlobalDownloaded, Stopwatch globalStopwatch)
+    private async ValueTask<int> ReadWithStallTimeoutAsync(Stream source, byte[] buffer, long offset,
+        CancellationToken ct)
+    {
+        using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        readCts.CancelAfter(_config.NoDataTimeout);
+
+        try
+        {
+            return await source.ReadAsync(buffer.AsMemory(0, _config.BufferSize), readCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new SegmentRetryException(offset,
+                $"no data was received for {_config.NoDataTimeout.TotalSeconds:0.#}s; the connection will be requeued.");
+        }
+    }
+
+    private static async ValueTask WriteAsync(FileStream dest, byte[] buffer, int count, string path,
+        CancellationToken ct)
+    {
+        try
+        {
+            await dest.WriteAsync(buffer.AsMemory(0, count), ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A local storage failure (out of space, permissions, unplugged volume) will not fix
+            // itself by retrying the request.
+            throw new FatalDownloadException($"Failed to write to '{path}': {ex.Message}", ex);
+        }
+    }
+
+    private async ValueTask FlushAsync(FileStream dest, CancellationToken ct)
+    {
+        await dest.FlushAsync(ct).ConfigureAwait(false);
+        if (_config.DurableFlush)
+            dest.Flush(flushToDisk: true);
+    }
+
+    private bool IsSlowSegment(
+        long segmentBytes,
+        Stopwatch segmentStopwatch,
+        Func<long> getSessionDownloaded,
+        Func<int> getActiveSegmentCount,
+        Stopwatch globalStopwatch)
     {
         if (segmentStopwatch.Elapsed < _config.SlowSegmentMinDuration)
             return false;
@@ -438,43 +714,10 @@ public sealed class LightDownloader : IDisposable
         if (globalSeconds <= 0 || segmentSeconds <= 0)
             return false;
 
-        var globalSpeed = getGlobalDownloaded() / globalSeconds;
+        var globalSpeed = getSessionDownloaded() / globalSeconds;
+        var averageConnectionSpeed = globalSpeed / Math.Max(getActiveSegmentCount(), 1);
         var segmentSpeed = segmentBytes / segmentSeconds;
-        return globalSpeed > 0 && segmentSpeed < globalSpeed * _config.SlowSpeedRatio;
-    }
-
-    private async Task DownloadSingleThreadAsync(Uri url, string path, long totalLength, IReadOnlyDictionary<string, string>? headers, Action<LightDownloadProgress>? progressChanged, CancellationToken ct)
-    {
-        var downloaded = new AtomicLong();
-        var sw = Stopwatch.StartNew();
-
-        using var progressCts = new CancellationTokenSource();
-        var progressTask = ReportProgressOnlyLoop(progressCts.Token, downloaded.Read, totalLength, progressChanged);
-        try
-        {
-            using var request = new HttpRequestMessage(HttpMethod.Get, url);
-            ApplyHeaders(request, headers);
-            using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-            response.EnsureSuccessStatusCode();
-
-            await using var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-            await using var dest = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None,
-                _config.BufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
-
-            var buffer = new byte[_config.BufferSize];
-            int read;
-            while ((read = await source.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
-            {
-                await dest.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                downloaded.Add(read);
-                await ApplySpeedLimitAsync(downloaded.Read(), sw, ct).ConfigureAwait(false);
-            }
-        }
-        finally
-        {
-            await StopProgressReportingAsync(progressCts, progressTask).ConfigureAwait(false);
-            sw.Stop();
-        }
+        return averageConnectionSpeed > 0 && segmentSpeed < averageConnectionSpeed * _config.SlowSpeedRatio;
     }
 
     private static async Task StopProgressReportingAsync(CancellationTokenSource cancellation, Task progressTask)
@@ -489,7 +732,8 @@ public sealed class LightDownloader : IDisposable
         }
     }
 
-    private async Task ReportProgressOnlyLoop(CancellationToken ct, Func<long> getDownloaded, long total, Action<LightDownloadProgress>? progressChanged)
+    private async Task ReportProgressOnlyLoop(CancellationToken ct, Func<long> getDownloaded, long total,
+        Action<LightDownloadProgress>? progressChanged)
     {
         var lastBytes = getDownloaded();
         var lastTime = Stopwatch.GetTimestamp();
@@ -503,13 +747,12 @@ public sealed class LightDownloader : IDisposable
             lastBytes = nowBytes;
             lastTime = nowTime;
 
-            var progress = new LightDownloadProgress
+            progressChanged?.Invoke(new LightDownloadProgress
             {
                 DownloadedBytes = nowBytes,
-                TotalBytes = total,
+                TotalBytes = Math.Max(total, 0),
                 Speed = speed,
-            };
-            progressChanged?.Invoke(progress);
+            });
         }
     }
 
@@ -536,17 +779,17 @@ public sealed class LightDownloader : IDisposable
             var seconds = (nowTime - lastTime) / (double)Stopwatch.Frequency;
             var speed = seconds > 0 ? (nowBytes - lastBytes) / seconds : 0;
 
-            var progress = new LightDownloadProgress
+            progressChanged?.Invoke(new LightDownloadProgress
             {
                 DownloadedBytes = nowBytes,
-                TotalBytes = total,
+                TotalBytes = Math.Max(total, 0),
                 Speed = speed,
-            };
-            progressChanged?.Invoke(progress);
+            });
 
             if (DateTimeOffset.UtcNow - lastAdapt >= _config.AdaptInterval)
             {
-                AdaptDownloadParameters(speed, previousSpeed, getConcurrency, setConcurrency, getSegmentSize, setSegmentSize);
+                AdaptDownloadParameters(speed, previousSpeed, getConcurrency, setConcurrency, getSegmentSize,
+                    setSegmentSize);
                 previousSpeed = speed;
                 lastAdapt = DateTimeOffset.UtcNow;
             }
@@ -580,15 +823,12 @@ public sealed class LightDownloader : IDisposable
         }
         else if (speed < previousSpeed * 0.85)
         {
-            if (_config.EnableDynamicConcurrency && concurrency < _config.MaxChunkCount)
-                setConcurrency(concurrency + 1);
+            // Adding connections to a link that just got slower makes it worse - back off instead.
+            if (_config.EnableDynamicConcurrency && concurrency > _config.MinChunkCount)
+                setConcurrency(concurrency - 1);
 
             if (_config.EnableDynamicSegmentSize && segmentSize > _config.MinSegmentSize)
                 setSegmentSize(Math.Max(segmentSize / 2, _config.MinSegmentSize));
-        }
-        else if (_config.EnableDynamicConcurrency && concurrency > _config.MinChunkCount)
-        {
-            setConcurrency(concurrency - 1);
         }
     }
 
@@ -617,26 +857,116 @@ public sealed class LightDownloader : IDisposable
             _config.MaxSegmentSize);
     }
 
-    private DownloadMetadata LoadOrCreateMetadata(string url, long totalLength, string tempPath, string metadataPath)
+    private TimeSpan GetRetryDelay(int retryCount, TimeSpan? retryAfter)
     {
+        if (retryAfter is { } serverDelay)
+            return serverDelay < TimeSpan.Zero ? TimeSpan.Zero :
+                serverDelay > _config.MaxRetryDelay ? _config.MaxRetryDelay : serverDelay;
+
+        var exponent = Math.Min(retryCount, 16);
+        var delayMs = _config.RetryBaseDelay.TotalMilliseconds * Math.Pow(2, exponent);
+        var capped = Math.Min(delayMs, _config.MaxRetryDelay.TotalMilliseconds);
+        // Jitter keeps a wave of failed segments from hammering the server in lockstep.
+        var jittered = capped * (0.8 + Random.Shared.NextDouble() * 0.4);
+        return TimeSpan.FromMilliseconds(Math.Max(jittered, 0));
+    }
+
+    private void NotifyRetry(long start, long end, int attempt, TimeSpan delay, Exception error)
+    {
+        if (_config.RetryHandler is not { } handler)
+            return;
+
+        SafeInvoke(() => handler(new LightDownloadRetry
+        {
+            Start = start,
+            End = end,
+            Attempt = attempt,
+            Delay = delay,
+            Error = error
+        }));
+    }
+
+    private static bool IsRetryable(Exception exception) => exception switch
+    {
+        FatalDownloadException => false,
+        SegmentRetryException => true,
+        HttpRequestException => true,
+        // HttpIOException (premature end of stream) and socket errors both land here. Local disk
+        // failures are wrapped as FatalDownloadException before they can reach this point.
+        IOException => true,
+        _ => false
+    };
+
+    private static bool IsPartialDataInvalid(Exception exception) =>
+        exception is FatalDownloadException { DiscardPartialData: true } or LightDownloadException;
+
+    /// <summary>
+    /// Presents a single exception type to callers. Internal signalling types must never escape,
+    /// and a transfer failure should not surface a different type depending on whether the server
+    /// reported a status or the socket simply died. Cancellation keeps its own semantics.
+    /// </summary>
+    private static Exception Rethrow(Exception exception)
+    {
+        return exception switch
+        {
+            OperationCanceledException or LightDownloadException => exception,
+            FatalDownloadException fatal => new LightDownloadException(fatal.Message, fatal.InnerException ?? fatal),
+            SegmentRetryException retry => new LightDownloadException(
+                $"The download failed: {retry.Message}", retry.InnerException ?? retry),
+            HttpRequestException or IOException => new LightDownloadException(
+                $"The download failed: {exception.Message}", exception),
+            _ => exception
+        };
+    }
+
+    private DownloadMetadata LoadOrCreateMetadata(string url, long totalLength, ProbeResult probe, string tempPath,
+        string metadataPath)
+    {
+        var fresh = new DownloadMetadata(url, totalLength, [])
+        {
+            ETag = probe.ETag,
+            LastModified = probe.LastModified
+        };
+
         if (!_config.EnableResume || !File.Exists(tempPath) || !File.Exists(metadataPath))
-            return new DownloadMetadata(url, totalLength, []);
+        {
+            DeleteIfExists(metadataPath);
+            return fresh;
+        }
 
         try
         {
             var json = File.ReadAllText(metadataPath);
             var metadata = JsonSerializer.Deserialize(json, LightDlJsonContext.Default.DownloadMetadata);
-            if (metadata?.Url == url && metadata.TotalLength == totalLength)
+            if (metadata is not null &&
+                metadata.Url == url &&
+                metadata.TotalLength == totalLength &&
+                ValidatorsMatch(metadata, probe))
                 return metadata;
         }
-        catch
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
         {
             // Broken metadata means a fresh download is safer.
         }
 
-        File.Delete(tempPath);
-        File.Delete(metadataPath);
-        return new DownloadMetadata(url, totalLength, []);
+        DeleteIfExists(tempPath);
+        DeleteIfExists(metadataPath);
+        return fresh;
+    }
+
+    /// <summary>
+    /// URL and length alone do not prove the bytes on the server are still the same bytes that were
+    /// partially downloaded, so an ETag/Last-Modified change forces a restart.
+    /// </summary>
+    private static bool ValidatorsMatch(DownloadMetadata metadata, ProbeResult probe)
+    {
+        if (metadata.ETag is not null || probe.ETag is not null)
+            return string.Equals(metadata.ETag, probe.ETag, StringComparison.Ordinal);
+
+        if (metadata.LastModified is not null || probe.LastModified is not null)
+            return string.Equals(metadata.LastModified, probe.LastModified, StringComparison.Ordinal);
+
+        return true;
     }
 
     private void AddCompletedRange(DownloadMetadata metadata, string metadataPath, long start, long end)
@@ -644,43 +974,153 @@ public sealed class LightDownloader : IDisposable
         if (end < start)
             return;
 
+        string json;
+        long version;
         lock (_metadataLock)
         {
-            metadata.CompletedRanges.Add(new CompletedRange(start, end));
-            metadata.CompletedRanges = MergeRanges(metadata.CompletedRanges.Select(r => new DownloadRange(r.Start, r.End)).ToList())
-                .Select(r => new CompletedRange(r.Start, r.End))
-                .ToList();
+            InsertRange(metadata.CompletedRanges, start, end);
+            if (!_config.EnableResume)
+                return;
 
-            if (_config.EnableResume)
-                SaveMetadata(metadata, metadataPath);
+            var now = Stopwatch.GetTimestamp();
+            if (Stopwatch.GetElapsedTime(_lastMetadataSaveTimestamp, now) < _config.MetadataFlushInterval)
+                return;
+
+            _lastMetadataSaveTimestamp = now;
+            version = ++_metadataVersion;
+            json = JsonSerializer.Serialize(metadata, LightDlJsonContext.Default.DownloadMetadata);
+        }
+
+        WriteMetadata(json, version, metadataPath);
+    }
+
+    private void ForceSaveMetadata(DownloadMetadata metadata, string metadataPath)
+    {
+        if (!_config.EnableResume)
+            return;
+
+        string json;
+        long version;
+        lock (_metadataLock)
+        {
+            _lastMetadataSaveTimestamp = Stopwatch.GetTimestamp();
+            version = ++_metadataVersion;
+            json = JsonSerializer.Serialize(metadata, LightDlJsonContext.Default.DownloadMetadata);
+        }
+
+        WriteMetadata(json, version, metadataPath);
+    }
+
+    private void WriteMetadata(string json, long version, string metadataPath)
+    {
+        lock (_metadataFileLock)
+        {
+            if (version <= _metadataWrittenVersion)
+                return;
+
+            _metadataWrittenVersion = version;
+            SaveMetadata(json, metadataPath, _config.HideMetadataFile);
         }
     }
 
-    private static void SaveMetadata(DownloadMetadata metadata, string metadataPath)
+    private static void SaveMetadata(string json, string metadataPath, bool hide)
     {
         var tempPath = metadataPath + ".tmp";
-        File.WriteAllText(tempPath, JsonSerializer.Serialize(metadata, LightDlJsonContext.Default.DownloadMetadata));
-        File.SetAttributes(tempPath, FileAttributes.Hidden);
+        try
+        {
+            File.WriteAllText(tempPath, json);
+            if (hide && OperatingSystem.IsWindows())
+                File.SetAttributes(tempPath, FileAttributes.Hidden);
 
-        if (File.Exists(metadataPath))
-            File.Replace(tempPath, metadataPath, null);
-        else
-            File.Move(tempPath, metadataPath);
+            if (File.Exists(metadataPath))
+                File.Replace(tempPath, metadataPath, null);
+            else
+                File.Move(tempPath, metadataPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Resume metadata is an optimisation: losing it costs a re-download, not correctness.
+            DeleteIfExists(tempPath);
+        }
+    }
+
+    private void EnsureAllRangesComplete(DownloadMetadata metadata, long totalLength)
+    {
+        List<DownloadRange> missing;
+        lock (_metadataLock)
+        {
+            metadata.CompletedRanges = MergeRanges(metadata.CompletedRanges);
+            missing = BuildMissingRanges(totalLength, metadata.CompletedRanges);
+        }
+
+        if (missing.Count == 0)
+            return;
+
+        var missingBytes = missing.Sum(range => range.End - range.Start + 1);
+        throw new LightDownloadException(
+            $"The download ended with {missingBytes} byte(s) missing across {missing.Count} range(s).");
+    }
+
+    private void EnsureFreeSpace(string path, long requiredBytes)
+    {
+        if (!_config.CheckFreeSpace || requiredBytes <= 0)
+            return;
+
+        long available;
+        string root;
+        try
+        {
+            root = Path.GetPathRoot(Path.GetFullPath(path)) ?? string.Empty;
+            if (root.Length == 0)
+                return;
+
+            available = new DriveInfo(root).AvailableFreeSpace;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException
+                                       or PlatformNotSupportedException)
+        {
+            // Free space cannot be determined for every mount; carry on and let the write fail.
+            return;
+        }
+
+        if (available < requiredBytes)
+            throw new LightDownloadException(
+                $"Not enough free space on '{root}': {requiredBytes} byte(s) required, {available} available.");
+    }
+
+    private async Task VerifyChecksumAsync(string path, CancellationToken ct)
+    {
+        if (_config.ChecksumAlgorithm == LightDownloadChecksumAlgorithm.None ||
+            string.IsNullOrWhiteSpace(_config.ExpectedChecksum))
+            return;
+
+        byte[] hash;
+        await using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                         bufferSize: 1, FileOptions.Asynchronous | FileOptions.SequentialScan))
+        {
+            hash = _config.ChecksumAlgorithm switch
+            {
+                LightDownloadChecksumAlgorithm.Md5 => await MD5.HashDataAsync(stream, ct).ConfigureAwait(false),
+                LightDownloadChecksumAlgorithm.Sha1 => await SHA1.HashDataAsync(stream, ct).ConfigureAwait(false),
+                LightDownloadChecksumAlgorithm.Sha256 => await SHA256.HashDataAsync(stream, ct).ConfigureAwait(false),
+                LightDownloadChecksumAlgorithm.Sha512 => await SHA512.HashDataAsync(stream, ct).ConfigureAwait(false),
+                _ => throw new ArgumentOutOfRangeException(nameof(LightDownloadConfig.ChecksumAlgorithm),
+                    _config.ChecksumAlgorithm, "Unknown checksum algorithm.")
+            };
+        }
+
+        var actual = Convert.ToHexString(hash);
+        var expected = _config.ExpectedChecksum.Trim().Replace("-", string.Empty);
+        if (!string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase))
+            throw new LightDownloadException(
+                $"{_config.ChecksumAlgorithm} checksum mismatch: expected {expected.ToLowerInvariant()}, got {actual.ToLowerInvariant()}.");
     }
 
     private static void Preallocate(string path, long totalLength)
     {
-        using var fs = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Write, 4096, FileOptions.None);
+        using var fs = new FileStream(path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite, 4096,
+            FileOptions.None);
         fs.SetLength(totalLength);
-    }
-
-    private static void DeletePartialFiles(string destinationPath, string tempPath, string metadataPath)
-    {
-        DeleteIfExists(tempPath);
-        DeleteIfExists(metadataPath);
-
-        if (string.Equals(tempPath, destinationPath, StringComparison.OrdinalIgnoreCase))
-            DeleteIfExists(destinationPath);
     }
 
     private static void DeleteIfExists(string path)
@@ -690,13 +1130,13 @@ public sealed class LightDownloader : IDisposable
             if (File.Exists(path))
                 File.Delete(path);
         }
-        catch
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             // Cleanup is best-effort. Preserve the original download exception.
         }
     }
 
-    private static List<DownloadRange> BuildMissingRanges(long totalLength, List<DownloadRange> completedRanges)
+    private static List<DownloadRange> BuildMissingRanges(long totalLength, List<CompletedRange> completedRanges)
     {
         var missing = new List<DownloadRange>();
         var cursor = 0L;
@@ -714,35 +1154,249 @@ public sealed class LightDownloader : IDisposable
         return missing;
     }
 
-    private static List<DownloadRange> MergeRanges(List<DownloadRange> ranges)
+    private static List<CompletedRange> MergeRanges(List<CompletedRange> ranges)
     {
         if (ranges.Count == 0)
             return ranges;
 
         ranges.Sort((a, b) => a.Start.CompareTo(b.Start));
-        var merged = new List<DownloadRange> { ranges[0] };
+        var merged = new List<CompletedRange> { new(ranges[0].Start, ranges[0].End) };
         for (var i = 1; i < ranges.Count; i++)
         {
             var last = merged[^1];
             var current = ranges[i];
             if (current.Start <= last.End + 1)
-            {
-                merged[^1] = new DownloadRange(last.Start, Math.Max(last.End, current.End));
-            }
+                last.End = Math.Max(last.End, current.End);
             else
-            {
-                merged.Add(current);
-            }
+                merged.Add(new CompletedRange(current.Start, current.End));
         }
 
         return merged;
     }
 
-    private static void ValidateContentRange(ContentRangeHeaderValue? contentRange, long start, long end, long totalLength)
+    /// <summary>
+    /// Inserts a range into an already sorted, non-overlapping list and merges it with its
+    /// neighbours. Avoids re-sorting and re-allocating the whole list on every commit.
+    /// </summary>
+    private static void InsertRange(List<CompletedRange> ranges, long start, long end)
     {
-        if (contentRange?.From != start || contentRange.To != end || contentRange.Length != totalLength)
-            throw new SegmentRetryException(start, "The server returned a Content-Range that does not match the requested range.");
+        var index = 0;
+        while (index < ranges.Count && ranges[index].Start < start)
+            index++;
+
+        ranges.Insert(index, new CompletedRange(start, end));
+
+        for (var i = index > 0 ? index - 1 : 0; i < ranges.Count - 1;)
+        {
+            if (ranges[i + 1].Start <= ranges[i].End + 1)
+            {
+                ranges[i].End = Math.Max(ranges[i].End, ranges[i + 1].End);
+                ranges.RemoveAt(i + 1);
+                continue;
+            }
+
+            if (i >= index)
+                break;
+
+            i++;
+        }
     }
+
+    private async Task<HttpResponseMessage> SendRangeRequestAsync(
+        DownloadTarget target,
+        long start,
+        long end,
+        long totalLength,
+        string? ifRange,
+        CancellationToken ct)
+    {
+        while (true)
+        {
+            var requestTarget = target.GetRequestTarget();
+            HttpResponseMessage response;
+            try
+            {
+                response = await SendWithRedirectsAsync(requestTarget.Uri, requestTarget.Headers,
+                    new RangeHeaderValue(start, end), ifRange, ct).ConfigureAwait(false);
+            }
+            catch (HttpRequestException) when (requestTarget.IsDirect)
+            {
+                target.Fallback();
+                continue;
+            }
+            catch (OperationCanceledException) when (requestTarget.IsDirect && !ct.IsCancellationRequested)
+            {
+                target.Fallback();
+                continue;
+            }
+            catch (HttpRequestException ex)
+            {
+                throw new SegmentRetryException(start, "the range request could not be sent.", ex);
+            }
+            catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
+            {
+                throw new SegmentRetryException(start, "the range request timed out.", ex);
+            }
+
+            if (response.StatusCode == HttpStatusCode.PartialContent &&
+                IsValidContentRange(response.Content.Headers.ContentRange, start, end, totalLength))
+                return response;
+
+            // 200 in answer to If-Range means the validator no longer matches: the file changed.
+            if (response.StatusCode == HttpStatusCode.OK && ifRange is not null)
+            {
+                response.Dispose();
+                throw new FatalDownloadException(
+                    "The remote file changed while it was being downloaded; the partial data is no longer valid.",
+                    discardPartialData: true);
+            }
+
+            var statusCode = response.StatusCode;
+            var retryAfter = GetRetryAfter(response);
+            response.Dispose();
+
+            if (requestTarget.IsDirect)
+            {
+                target.Fallback();
+                continue;
+            }
+
+            if (IsRetryableStatus(statusCode))
+                throw new SegmentRetryException(start,
+                    $"the server answered {(int)statusCode} {statusCode} to a range request.", retryAfter);
+
+            throw new FatalDownloadException(
+                $"The server answered {(int)statusCode} {statusCode} to a range request.",
+                discardPartialData: statusCode == HttpStatusCode.RequestedRangeNotSatisfiable);
+        }
+    }
+
+    private async Task<HttpResponseMessage> SendRequestAsync(DownloadTarget target, CancellationToken ct)
+    {
+        while (true)
+        {
+            var requestTarget = target.GetRequestTarget();
+            HttpResponseMessage response;
+            try
+            {
+                response = await SendWithRedirectsAsync(requestTarget.Uri, requestTarget.Headers, range: null,
+                    ifRange: null, ct).ConfigureAwait(false);
+            }
+            catch (HttpRequestException) when (requestTarget.IsDirect)
+            {
+                target.Fallback();
+                continue;
+            }
+            catch (OperationCanceledException) when (requestTarget.IsDirect && !ct.IsCancellationRequested)
+            {
+                target.Fallback();
+                continue;
+            }
+
+            if (response.IsSuccessStatusCode)
+                return response;
+
+            var statusCode = response.StatusCode;
+            var retryAfter = GetRetryAfter(response);
+            response.Dispose();
+
+            if (requestTarget.IsDirect)
+            {
+                target.Fallback();
+                continue;
+            }
+
+            if (IsRetryableStatus(statusCode))
+                throw new SegmentRetryException(0, $"the server answered {(int)statusCode} {statusCode}.", retryAfter);
+
+            throw new FatalDownloadException($"The server answered {(int)statusCode} {statusCode}.");
+        }
+    }
+
+    private static bool IsRetryableStatus(HttpStatusCode statusCode) => statusCode is
+        HttpStatusCode.RequestTimeout or
+        HttpStatusCode.TooManyRequests or
+        HttpStatusCode.InternalServerError or
+        HttpStatusCode.BadGateway or
+        HttpStatusCode.ServiceUnavailable or
+        HttpStatusCode.GatewayTimeout or
+        HttpStatusCode.InsufficientStorage or
+        (HttpStatusCode)425 or
+        (HttpStatusCode)509;
+
+    private static TimeSpan? GetRetryAfter(HttpResponseMessage response)
+    {
+        var retryAfter = response.Headers.RetryAfter;
+        if (retryAfter is null)
+            return null;
+
+        if (retryAfter.Delta is { } delta)
+            return delta;
+
+        if (retryAfter.Date is { } date)
+        {
+            var wait = date - DateTimeOffset.UtcNow;
+            return wait > TimeSpan.Zero ? wait : TimeSpan.Zero;
+        }
+
+        return null;
+    }
+
+    private static bool IsValidContentRange(ContentRangeHeaderValue? contentRange, long start, long end,
+        long totalLength)
+    {
+        return contentRange?.From == start && contentRange.To == end && contentRange.Length == totalLength;
+    }
+
+    private async Task<HttpResponseMessage> SendWithRedirectsAsync(
+        Uri uri,
+        IReadOnlyDictionary<string, string>? headers,
+        RangeHeaderValue? range,
+        string? ifRange,
+        CancellationToken ct)
+    {
+        var currentUri = uri;
+        var currentHeaders = headers;
+
+        for (var redirectCount = 0;; redirectCount++)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, currentUri);
+            request.Headers.Range = range;
+            // Any content coding would break the mapping between response bytes and file offsets.
+            request.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
+            if (range is not null && ifRange is not null)
+                request.Headers.TryAddWithoutValidation("If-Range", ifRange);
+
+            ApplyHeaders(request, currentHeaders);
+
+            var response = await _http.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                ct).ConfigureAwait(false);
+            if (!IsRedirect(response.StatusCode) || response.Headers.Location is not { } location)
+                return response;
+
+            if (redirectCount >= MaxRedirects)
+            {
+                response.Dispose();
+                throw new HttpRequestException($"The request exceeded the maximum of {MaxRedirects} redirects.");
+            }
+
+            var redirectUri = location.IsAbsoluteUri ? location : new Uri(currentUri, location);
+            if (!HaveSameAuthority(currentUri, redirectUri))
+                currentHeaders = WithoutSensitiveHeaders(currentHeaders);
+
+            currentUri = redirectUri;
+            response.Dispose();
+        }
+    }
+
+    private static bool IsRedirect(HttpStatusCode statusCode) => statusCode is
+        HttpStatusCode.MovedPermanently or
+        HttpStatusCode.Found or
+        HttpStatusCode.SeeOther or
+        HttpStatusCode.TemporaryRedirect or
+        HttpStatusCode.PermanentRedirect;
 
     private static void ApplyHeaders(HttpRequestMessage request, IReadOnlyDictionary<string, string>? headers)
     {
@@ -756,21 +1410,87 @@ public sealed class LightDownloader : IDisposable
         }
     }
 
+    private static bool HaveSameAuthority(Uri first, Uri second)
+    {
+        return string.Equals(first.Scheme, second.Scheme, StringComparison.OrdinalIgnoreCase) &&
+               string.Equals(first.Host, second.Host, StringComparison.OrdinalIgnoreCase) &&
+               first.Port == second.Port;
+    }
+
+    private static IReadOnlyDictionary<string, string>? WithoutSensitiveHeaders(
+        IReadOnlyDictionary<string, string>? headers)
+    {
+        if (headers is null || !headers.Keys.Any(IsSensitiveHeader))
+            return headers;
+
+        return headers
+            .Where(header => !IsSensitiveHeader(header.Key))
+            .ToDictionary(header => header.Key, header => header.Value, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSensitiveHeader(string name) =>
+        string.Equals(name, "Authorization", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(name, "Cookie", StringComparison.OrdinalIgnoreCase);
+
     private static string GetFileName(Uri url, HttpResponseMessage response)
     {
         var contentDisposition = response.Content.Headers.ContentDisposition;
-        var fileName = contentDisposition?.FileNameStar ?? contentDisposition?.FileName;
-        if (!string.IsNullOrWhiteSpace(fileName))
-            return SanitizeFileName(fileName.Trim('"'));
+        if (!string.IsNullOrWhiteSpace(contentDisposition?.FileNameStar))
+            return SanitizeFileName(contentDisposition.FileNameStar.Trim('"'));
 
-        var pathFileName = Path.GetFileName(url.LocalPath);
-        if (!string.IsNullOrWhiteSpace(pathFileName))
-            return SanitizeFileName(Uri.UnescapeDataString(pathFileName));
+        if (!string.IsNullOrWhiteSpace(contentDisposition?.FileName))
+        {
+            var fileName = contentDisposition.FileName.Trim('"');
+            return SanitizeFileName(TryRepairUtf8Mojibake(fileName));
+        }
 
-        return "download";
+        // Uri.Segments keeps the percent-encoding, so this decodes exactly once.
+        var segment = url.Segments.Length > 0 ? url.Segments[^1].TrimEnd('/') : string.Empty;
+        if (segment.Length > 0)
+        {
+            var decoded = Uri.UnescapeDataString(segment);
+            if (!string.IsNullOrWhiteSpace(decoded))
+                return SanitizeFileName(decoded);
+        }
+
+        return DefaultFileName;
     }
 
-    private bool TryHandleExistingFile(LightDownloadFileInfo info, ref string destinationPath, out LightDownloadResult result)
+    private static string TryRepairUtf8Mojibake(string fileName)
+    {
+        if (fileName.All(character => character <= 0x7f) || fileName.Any(character => character > byte.MaxValue))
+            return fileName;
+
+        try
+        {
+            var repaired = StrictUtf8.GetString(Encoding.Latin1.GetBytes(fileName));
+            return repaired.Any(character => character > 0x7f) &&
+                   (HasUtf8MojibakeMarkers(fileName) || ContainsCjkCharacter(repaired))
+                ? repaired
+                : fileName;
+        }
+        catch (DecoderFallbackException)
+        {
+            return fileName;
+        }
+    }
+
+    private static bool HasUtf8MojibakeMarkers(string value)
+    {
+        return value.IndexOfAny(['Ã', 'Â', 'â', 'ð', 'Ð', 'Ñ', 'Î', 'Ï']) >= 0 ||
+               value.Any(character => character is >= '\u0080' and <= '\u009f');
+    }
+
+    private static bool ContainsCjkCharacter(string value)
+    {
+        return value.Any(character => character is >= '\u3040' and <= '\u30ff' or
+            >= '\u3400' and <= '\u4dbf' or
+            >= '\u4e00' and <= '\u9fff' or
+            >= '\uac00' and <= '\ud7af');
+    }
+
+    private bool TryHandleExistingFile(LightDownloadFileInfo info, ref string destinationPath,
+        out LightDownloadResult result)
     {
         result = null!;
         if (!File.Exists(destinationPath))
@@ -785,7 +1505,8 @@ public sealed class LightDownloader : IDisposable
                 throw new IOException($"The destination file already exists: {destinationPath}");
 
             case LightDownloadFileConflictPolicy.Skip:
-                result = CreateDownloadResult(info, destinationPath, skipped: true, size: new FileInfo(destinationPath).Length);
+                result = CreateDownloadResult(info, destinationPath, skipped: true,
+                    size: new FileInfo(destinationPath).Length);
                 return true;
 
             case LightDownloadFileConflictPolicy.Rename:
@@ -793,11 +1514,13 @@ public sealed class LightDownloader : IDisposable
                 return false;
 
             default:
-                throw new ArgumentOutOfRangeException(nameof(_config.FileConflictPolicy), _config.FileConflictPolicy, "Unknown file conflict policy.");
+                throw new ArgumentOutOfRangeException(nameof(LightDownloadConfig.FileConflictPolicy),
+                    _config.FileConflictPolicy, "Unknown file conflict policy.");
         }
     }
 
-    private static string ResolveDestinationPath(string path, string fileName, LightDownloadDestinationKind destinationKind)
+    private static string ResolveDestinationPath(string path, string fileName,
+        LightDownloadDestinationKind destinationKind)
     {
         switch (destinationKind)
         {
@@ -816,8 +1539,46 @@ public sealed class LightDownloader : IDisposable
                 return Path.Combine(path, fileName);
 
             default:
-                throw new ArgumentOutOfRangeException(nameof(destinationKind), destinationKind, "Unknown destination kind.");
+                throw new ArgumentOutOfRangeException(nameof(destinationKind), destinationKind,
+                    "Unknown destination kind.");
         }
+    }
+
+    /// <summary>
+    /// Resolves where the resume metadata lives. On Unix "hidden" means a leading dot on the file
+    /// name, so the path itself changes; on Windows the name is unchanged and the Hidden attribute
+    /// is applied when the file is written.
+    /// </summary>
+    private string ResolveMetadataPath(string destinationPath)
+    {
+        var visiblePath = destinationPath + _config.MetadataFileExtension;
+        if (!_config.HideMetadataFile || OperatingSystem.IsWindows())
+            return visiblePath;
+
+        var fileName = Path.GetFileName(visiblePath);
+        if (fileName.StartsWith('.'))
+            return visiblePath;
+
+        var directory = Path.GetDirectoryName(visiblePath);
+        var hiddenPath = string.IsNullOrEmpty(directory)
+            ? "." + fileName
+            : Path.Combine(directory, "." + fileName);
+
+        // An older version wrote this file under the visible name; adopt it instead of restarting
+        // the download and leaving the old file orphaned.
+        if (File.Exists(visiblePath) && !File.Exists(hiddenPath))
+        {
+            try
+            {
+                File.Move(visiblePath, hiddenPath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return visiblePath;
+            }
+        }
+
+        return hiddenPath;
     }
 
     private static string GetUniqueFilePath(string path)
@@ -826,16 +1587,19 @@ public sealed class LightDownloader : IDisposable
         var name = Path.GetFileNameWithoutExtension(path);
         var extension = Path.GetExtension(path);
 
-        for (var i = 1; ; i++)
+        for (var i = 1;; i++)
         {
             var candidateName = string.IsNullOrEmpty(extension) ? $"{name} ({i})" : $"{name} ({i}){extension}";
-            var candidate = string.IsNullOrWhiteSpace(directory) ? candidateName : Path.Combine(directory, candidateName);
+            var candidate = string.IsNullOrWhiteSpace(directory)
+                ? candidateName
+                : Path.Combine(directory, candidateName);
             if (!File.Exists(candidate))
                 return candidate;
         }
     }
 
-    private static LightDownloadResult CreateDownloadResult(LightDownloadFileInfo info, string destinationPath, bool skipped = false, long? size = null)
+    private static LightDownloadResult CreateDownloadResult(LightDownloadFileInfo info, string destinationPath,
+        bool skipped = false, long? size = null)
     {
         return new LightDownloadResult
         {
@@ -848,26 +1612,157 @@ public sealed class LightDownloader : IDisposable
         };
     }
 
-    private static string SanitizeFileName(string fileName)
+    /// <summary>
+    /// Reduces a server-supplied name to something that can only ever create a single file inside
+    /// the destination directory.
+    /// </summary>
+    internal static string SanitizeFileName(string fileName)
     {
-        foreach (var invalidChar in Path.GetInvalidFileNameChars())
-            fileName = fileName.Replace(invalidChar, '_');
+        var invalidChars = Path.GetInvalidFileNameChars();
+        var builder = new StringBuilder(fileName.Length);
+        foreach (var character in fileName)
+        {
+            var invalid = char.IsControl(character) ||
+                          character is '/' or '\\' ||
+                          Array.IndexOf(invalidChars, character) >= 0;
+            builder.Append(invalid ? '_' : character);
+        }
 
-        fileName = fileName.Trim();
-        return string.IsNullOrWhiteSpace(fileName) ? "download" : fileName;
+        // Trailing dots and spaces are silently stripped by Windows, which turns "a. " into "a".
+        var result = builder.ToString().Trim().TrimEnd('.', ' ');
+        if (result.Length == 0 || result is "." or "..")
+            return DefaultFileName;
+
+        if (OperatingSystem.IsWindows() && IsWindowsReservedName(result))
+            result = "_" + result;
+
+        return TruncateFileName(result);
+    }
+
+    private static bool IsWindowsReservedName(string fileName)
+    {
+        var dot = fileName.IndexOf('.');
+        var stem = dot < 0 ? fileName : fileName[..dot];
+        if (stem.Equals("CON", StringComparison.OrdinalIgnoreCase) ||
+            stem.Equals("PRN", StringComparison.OrdinalIgnoreCase) ||
+            stem.Equals("AUX", StringComparison.OrdinalIgnoreCase) ||
+            stem.Equals("NUL", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        return stem.Length == 4 &&
+               (stem.StartsWith("COM", StringComparison.OrdinalIgnoreCase) ||
+                stem.StartsWith("LPT", StringComparison.OrdinalIgnoreCase)) &&
+               char.IsAsciiDigit(stem[3]);
+    }
+
+    private static string TruncateFileName(string fileName)
+    {
+        if (Encoding.UTF8.GetByteCount(fileName) <= MaxFileNameBytes)
+            return fileName;
+
+        var extension = Path.GetExtension(fileName);
+        if (Encoding.UTF8.GetByteCount(extension) > 32)
+            extension = string.Empty;
+
+        var stem = fileName[..^extension.Length];
+        var budget = MaxFileNameBytes - Encoding.UTF8.GetByteCount(extension);
+        while (stem.Length > 0 && Encoding.UTF8.GetByteCount(stem) > budget)
+            stem = stem[..^1];
+
+        if (stem.Length > 0 && char.IsHighSurrogate(stem[^1]))
+            stem = stem[..^1];
+
+        return stem.Length == 0 ? DefaultFileName : stem + extension;
+    }
+
+    private static Action<LightDownloadProgress>? BuildProgressReporter(
+        IProgress<LightDownloadProgress>? progress,
+        LightDownloadRequest request)
+    {
+        var handler = request.ProgressHandler;
+        if (progress is null && handler is null)
+            return null;
+
+        return value =>
+        {
+            SafeInvoke(() => progress?.Report(value));
+            SafeInvoke(() => handler?.Invoke(value));
+        };
+    }
+
+    /// <summary>Caller callbacks must never be able to fail the download they are observing.</summary>
+    private static void SafeInvoke(Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch
+        {
+            // Ignored on purpose.
+        }
+    }
+
+    private static void ValidateHandler(HttpMessageHandler handler)
+    {
+        var current = handler;
+        while (current is DelegatingHandler { InnerHandler: { } inner })
+            current = inner;
+
+        switch (current)
+        {
+            case SocketsHttpHandler sockets:
+                Check(sockets.AllowAutoRedirect, sockets.AutomaticDecompression);
+                break;
+            case HttpClientHandler client:
+                Check(client.AllowAutoRedirect, client.AutomaticDecompression);
+                break;
+        }
+
+        static void Check(bool allowAutoRedirect, DecompressionMethods decompression)
+        {
+            if (allowAutoRedirect)
+                throw new ArgumentException(
+                    "HttpMessageHandlerFactory must return a handler with AllowAutoRedirect disabled; LightDl follows redirects itself so that credentials can be stripped across origins.",
+                    nameof(LightDownloadConfig.HttpMessageHandlerFactory));
+
+            if (decompression != DecompressionMethods.None)
+                throw new ArgumentException(
+                    "HttpMessageHandlerFactory must return a handler with AutomaticDecompression disabled; decompressed bytes cannot be mapped back to byte ranges.",
+                    nameof(LightDownloadConfig.HttpMessageHandlerFactory));
+        }
     }
 
     private static void NormalizeConfig(LightDownloadConfig config)
     {
         config.BufferSize = Math.Max(config.BufferSize, 8 * 1024);
-        config.MinChunkCount = Math.Max(config.MinChunkCount, 1);
-        config.ChunkCount = Math.Max(config.ChunkCount, config.MinChunkCount);
+
+        // Ordering matters here: clamping against an un-normalised bound either throws or silently
+        // overrides an explicit ChunkCount. MinChunkCount only bounds dynamic concurrency, so it
+        // must never raise the worker count the caller asked for.
+        config.ChunkCount = Math.Max(config.ChunkCount, 1);
+        config.MinChunkCount = Math.Clamp(config.MinChunkCount, 1, config.ChunkCount);
         config.MaxChunkCount = Math.Max(config.MaxChunkCount, config.ChunkCount);
+
         config.MinSegmentSize = Math.Max(config.MinSegmentSize, config.BufferSize);
+        config.MaxSegmentSize = Math.Max(config.MaxSegmentSize, config.MinSegmentSize);
         config.SegmentSize = Math.Clamp(config.SegmentSize, config.MinSegmentSize, config.MaxSegmentSize);
-        config.MaxSegmentSize = Math.Max(config.MaxSegmentSize, config.SegmentSize);
+
         config.ProgressIntervalMs = Math.Max(config.ProgressIntervalMs, 100);
         config.MaxRetry = Math.Max(config.MaxRetry, 0);
+
+        if (config.Timeout <= TimeSpan.Zero)
+            config.Timeout = Timeout.InfiniteTimeSpan;
+        if (config.ConnectTimeout <= TimeSpan.Zero)
+            config.ConnectTimeout = Timeout.InfiniteTimeSpan;
+        if (config.NoDataTimeout <= TimeSpan.Zero)
+            config.NoDataTimeout = TimeSpan.FromSeconds(15);
+        if (config.RetryBaseDelay < TimeSpan.Zero)
+            config.RetryBaseDelay = TimeSpan.Zero;
+        if (config.MaxRetryDelay < config.RetryBaseDelay)
+            config.MaxRetryDelay = config.RetryBaseDelay;
+        if (config.MetadataFlushInterval < TimeSpan.Zero)
+            config.MetadataFlushInterval = TimeSpan.Zero;
     }
 
     private sealed class RangeAllocator(IEnumerable<DownloadRange> ranges)
@@ -905,7 +1800,71 @@ public sealed class LightDownloader : IDisposable
         }
     }
 
+    /// <summary>Holds the first fatal error so it can be rethrown instead of the cancellations it caused.</summary>
+    private sealed class FailureState
+    {
+        private ExceptionDispatchInfo? _first;
+
+        public bool TrySet(Exception exception) =>
+            Interlocked.CompareExchange(ref _first, ExceptionDispatchInfo.Capture(exception), null) is null;
+
+        public void ThrowIfFailed() => Volatile.Read(ref _first)?.Throw();
+    }
+
     private readonly record struct DownloadRange(long Start, long End);
+
+    private readonly record struct RequestTarget(Uri Uri, IReadOnlyDictionary<string, string>? Headers, bool IsDirect);
+
+    private sealed record ProbeResult(
+        string FileName,
+        long Size,
+        string? ContentType,
+        bool SupportsRange,
+        Uri DownloadUri,
+        string? ETag,
+        string? IfRange,
+        string? LastModified)
+    {
+        public LightDownloadFileInfo CreateFileInfo(string destinationPath) => new()
+        {
+            FileName = FileName,
+            FilePath = destinationPath,
+            Size = Size,
+            ContentType = ContentType,
+            SupportsRange = SupportsRange
+        };
+    }
+
+    private sealed class DownloadTarget
+    {
+        private readonly Uri _originalUri;
+        private readonly Uri _directUri;
+        private readonly IReadOnlyDictionary<string, string>? _originalHeaders;
+        private readonly IReadOnlyDictionary<string, string>? _directHeaders;
+        private readonly bool _hasDirectUri;
+        private int _useFallback;
+
+        public DownloadTarget(Uri originalUri, Uri directUri, IReadOnlyDictionary<string, string>? headers)
+        {
+            _originalUri = originalUri;
+            _directUri = directUri;
+            _originalHeaders = headers;
+            _directHeaders = HaveSameAuthority(originalUri, directUri) ? headers : WithoutSensitiveHeaders(headers);
+            _hasDirectUri = originalUri != directUri;
+        }
+
+        public RequestTarget GetRequestTarget()
+        {
+            return _hasDirectUri && Volatile.Read(ref _useFallback) == 0
+                ? new RequestTarget(_directUri, _directHeaders, true)
+                : new RequestTarget(_originalUri, _originalHeaders, false);
+        }
+
+        public void Fallback()
+        {
+            Volatile.Write(ref _useFallback, 1);
+        }
+    }
 
     private readonly record struct DownloadSegment(long Start, long End, int RetryCount);
 
@@ -931,19 +1890,51 @@ public sealed class LightDownloader : IDisposable
 
         public long TotalLength { get; init; } = totalLength;
 
+        public string? ETag { get; init; }
+
+        public string? LastModified { get; init; }
+
         public List<CompletedRange> CompletedRanges { get; set; } = completedRanges;
     }
 
-    private sealed class SegmentRetryException(long nextStart, string message, Exception? innerException = null)
+    /// <summary>A transient segment failure: the range can be requeued and retried.</summary>
+    private sealed class SegmentRetryException(
+        long nextStart,
+        string message,
+        TimeSpan? retryAfter = null,
+        Exception? innerException = null)
         : Exception(message, innerException)
     {
+        public SegmentRetryException(long nextStart, string message, Exception? innerException)
+            : this(nextStart, message, null, innerException)
+        {
+        }
+
         public long NextStart { get; } = nextStart;
+
+        public TimeSpan? RetryAfter { get; } = retryAfter;
+    }
+
+    /// <summary>A permanent failure: retrying cannot help, so the whole download stops now.</summary>
+    private sealed class FatalDownloadException(
+        string message,
+        Exception? innerException = null,
+        bool discardPartialData = false)
+        : Exception(message, innerException)
+    {
+        public FatalDownloadException(string message, bool discardPartialData)
+            : this(message, null, discardPartialData)
+        {
+        }
+
+        public bool DiscardPartialData { get; } = discardPartialData;
     }
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) == 1)
+            return;
+
         _http.Dispose();
     }
 }
