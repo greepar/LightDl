@@ -46,6 +46,12 @@ public sealed class FakeOrigin
     /// <summary>Delay applied while streaming each body.</summary>
     public TimeSpan BodyDelay { get; set; }
 
+    /// <summary>Extra per-chunk delay applied only to ranges at or past this offset.</summary>
+    public (long From, TimeSpan Delay)? SlowTailFrom { get; set; }
+
+    /// <summary>Status returned for requests carrying this If-Range value, simulating an expired signed URL.</summary>
+    public (int AfterRequests, HttpStatusCode Status)? ExpireAfter { get; set; }
+
     public IReadOnlyList<RequestRecord> Requests
     {
         get
@@ -112,6 +118,15 @@ public sealed class FakeOrigin
         if (range is not null && FailRangeAt is { } failRange && range.From == failRange.Start)
             return new HttpResponseMessage(failRange.Status) { RequestMessage = request };
 
+        if (ExpireAfter is { } expiry)
+        {
+            lock (_lock)
+            {
+                if (_requests.Count > expiry.AfterRequests)
+                    return new HttpResponseMessage(expiry.Status) { RequestMessage = request };
+            }
+        }
+
         // If-Range with a stale validator must fall back to a full 200 response.
         var validatorStale = ifRange is not null && ETag is not null && ifRange != ETag;
 
@@ -138,10 +153,13 @@ public sealed class FakeOrigin
         var slice = new byte[length];
         Array.Copy(content, from, slice, 0, length);
 
+        var tailDelay = SlowTailFrom is { } tail && from >= tail.From ? tail.Delay : TimeSpan.Zero;
         var partial = new HttpResponseMessage(HttpStatusCode.PartialContent)
         {
             RequestMessage = request,
-            Content = new StreamContent(await BuildBodyAsync(slice, ct).ConfigureAwait(false))
+            Content = new StreamContent(tailDelay > TimeSpan.Zero
+                ? new SlowStream(slice, tailDelay, 8 * 1024)
+                : await BuildBodyAsync(slice, ct).ConfigureAwait(false))
         };
         partial.Content.Headers.ContentLength = length;
         partial.Content.Headers.ContentRange = new ContentRangeHeaderValue(from, to, content.Length);

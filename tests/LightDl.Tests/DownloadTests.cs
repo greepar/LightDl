@@ -446,4 +446,76 @@ public sealed class DownloadTests : IDisposable
         var error = Assert.Throws<ArgumentException>(() => new LightDownloader(config));
         Assert.Contains("AutomaticDecompression", error.Message);
     }
+    // --- Regression: the tail of a download must finish, not loop on slow-segment requeues -------
+
+    [Fact]
+    public async Task A_Slow_Final_Segment_Still_Completes()
+    {
+        var content = MakeContent(2 * 1024 * 1024);
+        // The last quarter trickles; the rest is instant, so the session average is far above it.
+        var origin = new FakeOrigin(content)
+        {
+            SlowTailFrom = (1536 * 1024, TimeSpan.FromMilliseconds(2))
+        };
+        var config = BaseConfig(origin);
+        config.SegmentSize = 512 * 1024;
+        config.MaxSegmentSize = 512 * 1024;
+        config.SlowSegmentMinDuration = TimeSpan.FromMilliseconds(50);
+        config.MinRemainingBytesForRequeue = 1024;
+        config.StallTimeout = TimeSpan.FromSeconds(30);
+
+        using var downloader = new LightDownloader(config);
+        var result = await downloader.DownloadAsync(LightDownloadRequest.ToFile(Url, Path("out.bin")))
+            .WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.Equal(content, await File.ReadAllBytesAsync(result.FilePath));
+    }
+
+    // --- Regression: a signed download URL that expires mid-download is re-resolved --------------
+
+    [Fact]
+    public async Task An_Expiring_Download_Url_Is_Re_Resolved()
+    {
+        var content = MakeContent(1024 * 1024);
+        var origin = new FakeOrigin(content)
+        {
+            ETag = "\"v1\"",
+            // Everything after the probe plus two segments answers 403, like an expired signature.
+            ExpireAfter = (3, HttpStatusCode.Forbidden)
+        };
+        var config = BaseConfig(origin);
+        config.SegmentSize = 256 * 1024;
+        config.MaxSegmentSize = 256 * 1024;
+
+        using var downloader = new LightDownloader(config);
+        var error = await Assert.ThrowsAsync<LightDownloadException>(() =>
+            downloader.DownloadAsync(LightDownloadRequest.ToFile(Url, Path("out.bin"))));
+
+        // A 403 must be reported as a 403, never misread as "the remote file changed".
+        Assert.Contains("403", error.Message);
+        Assert.DoesNotContain("changed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // --- Regression: a wedged download fails instead of hanging forever --------------------------
+
+    [Fact]
+    public async Task A_Wedged_Download_Fails_With_A_Stall_Error()
+    {
+        var origin = new FakeOrigin(MakeContent(4 * 1024 * 1024))
+        {
+            // Every body stalls: no bytes ever arrive.
+            BodyDelay = TimeSpan.FromHours(1)
+        };
+        var config = BaseConfig(origin);
+        config.NoDataTimeout = TimeSpan.FromMilliseconds(300);
+        config.StallTimeout = TimeSpan.FromSeconds(3);
+        config.MaxRetry = 1000;
+
+        using var downloader = new LightDownloader(config);
+        var error = await Assert.ThrowsAsync<LightDownloadException>(() =>
+            downloader.DownloadAsync(LightDownloadRequest.ToFile(Url, Path("out.bin"))))
+            .WaitAsync(TimeSpan.FromSeconds(45));
+
+        Assert.Contains("stalled", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
 }

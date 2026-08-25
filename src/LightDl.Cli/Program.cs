@@ -1,3 +1,4 @@
+using System.Reflection;
 using LightDl;
 
 return await RunAsync(args);
@@ -22,6 +23,12 @@ static async Task<int> RunAsync(string[] args)
         return 0;
     }
 
+    if (options.ShowVersion)
+    {
+        Console.WriteLine($"lightdl {GetVersion()}");
+        return 0;
+    }
+
     using var cancellation = new CancellationTokenSource();
     Console.CancelKeyPress += (_, eventArgs) =>
     {
@@ -35,6 +42,12 @@ static async Task<int> RunAsync(string[] args)
         EnableResume = options.EnableResume,
         IgnoreSslErrors = options.IgnoreSslErrors
     };
+
+    if (options.Verbose)
+    {
+        config.RetryHandler = retry => Console.Error.WriteLine(
+            $"\nretry #{retry.Attempt} [{retry.Start}-{retry.End}] in {retry.Delay.TotalSeconds:F1}s: {retry.Error.Message}");
+    }
 
     if (options.ChunkCount is { } chunkCount)
         config.ChunkCount = chunkCount;
@@ -71,11 +84,22 @@ static async Task<int> RunAsync(string[] args)
     try
     {
         using var downloader = new LightDownloader(config);
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         var result = await downloader.DownloadAsync(request, cancellation.Token);
+        stopwatch.Stop();
         if (lastProgressLength > 0)
             Console.WriteLine();
 
-        Console.WriteLine(result.Skipped ? $"Skipped: {result.FilePath}" : $"Saved: {result.FilePath}");
+        if (result.Skipped)
+        {
+            Console.WriteLine($"Skipped: {result.FilePath}");
+            return 0;
+        }
+
+        var seconds = stopwatch.Elapsed.TotalSeconds;
+        var average = seconds > 0 ? result.Size / seconds : 0;
+        Console.WriteLine($"Saved: {result.FilePath}");
+        Console.WriteLine($"Time:  {FormatDuration(stopwatch.Elapsed)}  (avg {FormatBytes(average)}/s)");
         return 0;
     }
     catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
@@ -104,6 +128,7 @@ static CliOptions ParseArguments(string[] args)
     LightDownloadFileConflictPolicy? conflictPolicy = null;
     var enableResume = true;
     var ignoreSslErrors = false;
+    var verbose = false;
     var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
     for (var i = 0; i < args.Length; i++)
@@ -114,6 +139,14 @@ static CliOptions ParseArguments(string[] args)
             case "-h":
             case "--help":
                 return new CliOptions { ShowHelp = true };
+
+            case "-v":
+            case "--version":
+                return new CliOptions { ShowVersion = true };
+
+            case "--verbose":
+                verbose = true;
+                break;
 
             case "-o":
             case "--output":
@@ -186,6 +219,7 @@ static CliOptions ParseArguments(string[] args)
 
     return new CliOptions
     {
+        Verbose = verbose,
         Url = uri.AbsoluteUri,
         DestinationPath = destination,
         DestinationKind = destinationKind,
@@ -230,6 +264,30 @@ static string FormatBytes(double bytes)
     return $"{bytes:F1} {units[unit]}";
 }
 
+static string GetVersion()
+{
+    var assembly = Assembly.GetExecutingAssembly();
+    var informational = assembly
+        .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+    if (!string.IsNullOrWhiteSpace(informational))
+    {
+        // Strip the "+<commit sha>" source-link suffix.
+        var plus = informational.IndexOf('+');
+        return plus < 0 ? informational : informational[..plus];
+    }
+
+    return assembly.GetName().Version?.ToString(3) ?? "unknown";
+}
+
+static string FormatDuration(TimeSpan elapsed)
+{
+    return elapsed.TotalHours >= 1
+        ? $"{(int)elapsed.TotalHours}h {elapsed.Minutes}m {elapsed.Seconds}s"
+        : elapsed.TotalMinutes >= 1
+            ? $"{elapsed.Minutes}m {elapsed.Seconds}s"
+            : $"{elapsed.TotalSeconds:F1}s";
+}
+
 static void PrintHelp()
 {
     Console.WriteLine("""
@@ -248,7 +306,9 @@ static void PrintHelp()
               --no-resume           Disable resume support
               --ignore-ssl-errors   Ignore TLS certificate validation errors
           -H, --header <header>     Add a request header, for example "Authorization: Bearer token"
+              --verbose             Report retries and stalls to stderr
           -h, --help                Show help
+          -v, --version             Show version
 
         Examples:
           lightdl https://example.com/file.zip
@@ -261,6 +321,8 @@ static void PrintHelp()
 file sealed class CliOptions
 {
     public bool ShowHelp { get; init; }
+    public bool ShowVersion { get; init; }
+    public bool Verbose { get; init; }
     public string? Url { get; init; }
     public string? DestinationPath { get; init; }
     public LightDownloadDestinationKind DestinationKind { get; init; }

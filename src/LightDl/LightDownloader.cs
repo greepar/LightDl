@@ -285,7 +285,13 @@ public sealed class LightDownloader : IDisposable
             () => Volatile.Read(ref currentConcurrency),
             value => Volatile.Write(ref currentConcurrency, value),
             () => Interlocked.Read(ref currentSegmentSize),
-            value => Interlocked.Exchange(ref currentSegmentSize, value));
+            value => Interlocked.Exchange(ref currentSegmentSize, value),
+            stalledFor =>
+            {
+                if (failure.TrySet(new LightDownloadException(
+                        $"The download stalled: no data arrived on any connection for {stalledFor.TotalSeconds:0}s.")))
+                    failureCts.Cancel();
+            });
 
         var workerCount = _config.EnableDynamicConcurrency ? _config.MaxChunkCount : _config.ChunkCount;
         var workers = new Task[workerCount];
@@ -550,8 +556,10 @@ public sealed class LightDownloader : IDisposable
                 supportsRange,
                 downloadUri,
                 eTag?.ToString(),
-                // A weak validator must not be used for If-Range; it only proves semantic equivalence.
-                eTag is { IsWeak: false } ? eTag.ToString() : lastModified,
+                // Only a strong ETag is trustworthy here. A weak one only proves semantic
+                // equivalence, and Last-Modified is restamped per response by some origins
+                // (signed CDN URLs), which would make every range request fail validation.
+                eTag is { IsWeak: false } ? eTag.ToString() : null,
                 lastModified);
         }
         finally
@@ -709,6 +717,12 @@ public sealed class LightDownloader : IDisposable
         if (segmentStopwatch.Elapsed < _config.SlowSegmentMinDuration)
             return false;
 
+        // Near the end only a few segments remain, and the session average still reflects the
+        // full width of the download. Comparing one connection against that aggregate marks the
+        // last segment slow forever, so it is requeued again and again and never finishes.
+        if (getActiveSegmentCount() < 2)
+            return false;
+
         var globalSeconds = globalStopwatch.Elapsed.TotalSeconds;
         var segmentSeconds = segmentStopwatch.Elapsed.TotalSeconds;
         if (globalSeconds <= 0 || segmentSeconds <= 0)
@@ -764,12 +778,15 @@ public sealed class LightDownloader : IDisposable
         Func<int> getConcurrency,
         Action<int> setConcurrency,
         Func<long> getSegmentSize,
-        Action<long> setSegmentSize)
+        Action<long> setSegmentSize,
+        Action<TimeSpan> onStalled)
     {
         var lastBytes = getDownloaded();
         var lastTime = Stopwatch.GetTimestamp();
         var lastAdapt = DateTimeOffset.UtcNow;
         var previousSpeed = 0d;
+        var lastProgressBytes = lastBytes;
+        var lastProgressTime = Stopwatch.GetTimestamp();
 
         while (!ct.IsCancellationRequested)
         {
@@ -796,6 +813,21 @@ public sealed class LightDownloader : IDisposable
 
             lastBytes = nowBytes;
             lastTime = nowTime;
+
+            if (nowBytes > lastProgressBytes)
+            {
+                lastProgressBytes = nowBytes;
+                lastProgressTime = nowTime;
+            }
+            else if (_config.StallTimeout > TimeSpan.Zero)
+            {
+                var stalledFor = Stopwatch.GetElapsedTime(lastProgressTime, nowTime);
+                if (stalledFor >= _config.StallTimeout)
+                {
+                    onStalled(stalledFor);
+                    return;
+                }
+            }
         }
     }
 
@@ -963,9 +995,8 @@ public sealed class LightDownloader : IDisposable
         if (metadata.ETag is not null || probe.ETag is not null)
             return string.Equals(metadata.ETag, probe.ETag, StringComparison.Ordinal);
 
-        if (metadata.LastModified is not null || probe.LastModified is not null)
-            return string.Equals(metadata.LastModified, probe.LastModified, StringComparison.Ordinal);
-
+        // Deliberately not comparing Last-Modified: origins that restamp it per response would
+        // discard a perfectly good partial download on every resume.
         return true;
     }
 
@@ -1242,6 +1273,16 @@ public sealed class LightDownloader : IDisposable
                 IsValidContentRange(response.Content.Headers.ContentRange, start, end, totalLength))
                 return response;
 
+            // A signed download URL captured at probe time can expire mid-download. Re-resolving
+            // through the original URL mints a new one, so that must be tried before concluding
+            // anything about the response - including an If-Range miss.
+            if (requestTarget.IsDirect)
+            {
+                target.Fallback();
+                response.Dispose();
+                continue;
+            }
+
             // 200 in answer to If-Range means the validator no longer matches: the file changed.
             if (response.StatusCode == HttpStatusCode.OK && ifRange is not null)
             {
@@ -1254,12 +1295,6 @@ public sealed class LightDownloader : IDisposable
             var statusCode = response.StatusCode;
             var retryAfter = GetRetryAfter(response);
             response.Dispose();
-
-            if (requestTarget.IsDirect)
-            {
-                target.Fallback();
-                continue;
-            }
 
             if (IsRetryableStatus(statusCode))
                 throw new SegmentRetryException(start,

@@ -81,6 +81,13 @@ public class LightDownloadConfig
     /// <summary>Abort and requeue a segment if no data is received for this duration. Default is 15 seconds.</summary>
     public TimeSpan NoDataTimeout { get; set; } = TimeSpan.FromSeconds(15);
 
+    /// <summary>
+    /// Fails the download when not a single byte arrives across all workers for this long. Guards
+    /// against a stall that individual segment retries cannot resolve. Zero or less disables it.
+    /// Default is 2 minutes.
+    /// </summary>
+    public TimeSpan StallTimeout { get; set; } = TimeSpan.FromMinutes(2);
+
     /// <summary>Marks a segment as slow when its average speed is below this ratio of the global average speed.</summary>
     public double SlowSpeedRatio { get; set; } = 0.05;
 
@@ -160,6 +167,7 @@ public class LightDownloadConfig
             RetryHandler = RetryHandler,
             SlowSegmentMinDuration = SlowSegmentMinDuration,
             NoDataTimeout = NoDataTimeout,
+            StallTimeout = StallTimeout,
             SlowSpeedRatio = SlowSpeedRatio,
             MinRemainingBytesForRequeue = MinRemainingBytesForRequeue,
             ProgressIntervalMs = ProgressIntervalMs,
