@@ -20,14 +20,15 @@ public class LightDownloadConfig
     /// <summary>Enables dynamic concurrency. Disabled by default.</summary>
     public bool EnableDynamicConcurrency { get; set; }
 
-    /// <summary>Download segment size. Default is 16 MB.</summary>
-    public long SegmentSize { get; set; } = 16L * 1024 * 1024;
+    /// <summary>Upper bound on one segment. The effective size also scales with file size and
+    /// worker count, so small files still spread across every worker. Default is 64 MB.</summary>
+    public long SegmentSize { get; set; } = 64L * 1024 * 1024;
 
     /// <summary>Minimum segment size when dynamic segment sizing is enabled. Default is 1 MB.</summary>
     public long MinSegmentSize { get; set; } = 1L * 1024 * 1024;
 
-    /// <summary>Maximum segment size when dynamic segment sizing is enabled. Default is 16 MB.</summary>
-    public long MaxSegmentSize { get; set; } = 16L * 1024 * 1024;
+    /// <summary>Maximum segment size when dynamic segment sizing is enabled. Default is 64 MB.</summary>
+    public long MaxSegmentSize { get; set; } = 64L * 1024 * 1024;
 
     /// <summary>Enables dynamic segment sizing. Disabled by default.</summary>
     public bool EnableDynamicSegmentSize { get; set; }

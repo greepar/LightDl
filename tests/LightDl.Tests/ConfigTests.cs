@@ -61,4 +61,48 @@ public sealed class ConfigTests
         Assert.True(config.MaxRetryDelay >= config.RetryBaseDelay);
         Assert.True(config.NoDataTimeout > TimeSpan.Zero);
     }
+
+    private static long SegmentSize(LightDownloadConfig config, long totalLength, int concurrency)
+    {
+        var downloader = new LightDownloader(config);
+        try
+        {
+            return (long)typeof(LightDownloader)
+                .GetMethod("CalculateStableSegmentSize", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .Invoke(downloader, [totalLength, concurrency])!;
+        }
+        finally
+        {
+            downloader.Dispose();
+        }
+    }
+
+    [Fact]
+    public void A_Large_File_Gets_Segments_Big_Enough_To_Amortise_The_Request()
+    {
+        // 1.4 GB over 16 workers. 16 MB segments measured 58 MB/s against a per-connection
+        // throttled origin where ~48 MB reached 88 MB/s.
+        var size = SegmentSize(new LightDownloadConfig(), 1_522_314_091L, 16);
+
+        Assert.InRange(size, 32L * 1024 * 1024, 64L * 1024 * 1024);
+    }
+
+    [Fact]
+    public void A_Small_File_Still_Divides_Across_Every_Worker()
+    {
+        var totalLength = 8L * 1024 * 1024;
+        var size = SegmentSize(new LightDownloadConfig(), totalLength, 16);
+
+        // Every worker must have something to do rather than one worker taking the whole file.
+        Assert.True(totalLength / size >= 16, $"{totalLength / size} segments for 16 workers");
+    }
+
+    [Fact]
+    public void An_Explicit_SegmentSize_Is_Still_An_Upper_Bound()
+    {
+        var config = new LightDownloadConfig { SegmentSize = 4L * 1024 * 1024, MaxSegmentSize = 4L * 1024 * 1024 };
+        var size = SegmentSize(config, 1_522_314_091L, 16);
+
+        Assert.Equal(4L * 1024 * 1024, size);
+    }
 }
