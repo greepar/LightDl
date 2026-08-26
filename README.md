@@ -13,7 +13,7 @@ dotnet add package LightDl
 Or add it to your `.csproj`:
 
 ```xml
-<PackageReference Include="LightDl" Version="0.4.1" />
+<PackageReference Include="LightDl" Version="0.4.2" />
 ```
 
 ## Usage
@@ -129,7 +129,7 @@ On Windows, use `lightdl.exe`. Run `lightdl --help` to see all options. The defa
 
 ## Releases
 
-Pushing a version tag such as `v0.4.1` runs `.github/workflows/release.yml`. The workflow builds all Native AOT CLI archives, creates `LightDl.0.4.1.nupkg`, generates SHA-256 checksums, and attaches everything to the GitHub Release.
+Pushing a version tag such as `v0.4.2` runs `.github/workflows/release.yml`. The workflow builds all Native AOT CLI archives, creates `LightDl.0.4.2.nupkg`, generates SHA-256 checksums, and attaches everything to the GitHub Release.
 
 ## License
 

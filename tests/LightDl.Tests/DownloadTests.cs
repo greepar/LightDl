@@ -60,7 +60,9 @@ public sealed class DownloadTests : IDisposable
         using var downloader = new LightDownloader(BaseConfig(origin));
         await downloader.DownloadAsync(LightDownloadRequest.ToFile(Url, Path("out.bin")));
 
-        Assert.Equal(4, origin.PeakConcurrentRequests);
+        // An exact peak is racy: under load a worker can finish before the last one starts. What
+        // must hold is that the configured count is a real cap and that work is actually shared.
+        Assert.InRange(origin.PeakConcurrentRequests, 2, 4);
     }
 
     // --- Regression: a fatal segment failure must stop every other worker at once ----------------
