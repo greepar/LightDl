@@ -105,4 +105,47 @@ public sealed class ConfigTests
 
         Assert.Equal(4L * 1024 * 1024, size);
     }
+
+    private static TimeSpan StallTimeout(LightDownloadConfig config, int active, int concurrency)
+    {
+        var downloader = new LightDownloader(config);
+        try
+        {
+            return (TimeSpan)typeof(LightDownloader)
+                .GetMethod("GetStallTimeout", BindingFlags.NonPublic | BindingFlags.Instance)!
+                .Invoke(downloader, [active, concurrency])!;
+        }
+        finally
+        {
+            downloader.Dispose();
+        }
+    }
+
+    [Fact]
+    public void A_Busy_Download_Waits_The_Full_NoDataTimeout()
+    {
+        var config = new LightDownloadConfig { NoDataTimeout = TimeSpan.FromSeconds(20) };
+
+        Assert.Equal(TimeSpan.FromSeconds(20), StallTimeout(config, active: 24, concurrency: 24));
+    }
+
+    [Fact]
+    public void Idle_Workers_Shorten_The_Wait_On_A_Stalled_Connection()
+    {
+        var config = new LightDownloadConfig { NoDataTimeout = TimeSpan.FromSeconds(20) };
+
+        // Measured on a bed where the tail stalls: 95.4s -> 67.8s median over 5 runs.
+        var idle = StallTimeout(config, active: 2, concurrency: 24);
+
+        Assert.True(idle < TimeSpan.FromSeconds(20), $"idle wait was {idle}");
+        Assert.True(idle >= TimeSpan.FromSeconds(3), $"idle wait was {idle}");
+    }
+
+    [Fact]
+    public void A_Short_NoDataTimeout_Is_Never_Lengthened()
+    {
+        var config = new LightDownloadConfig { NoDataTimeout = TimeSpan.FromSeconds(1) };
+
+        Assert.Equal(TimeSpan.FromSeconds(1), StallTimeout(config, active: 1, concurrency: 24));
+    }
 }

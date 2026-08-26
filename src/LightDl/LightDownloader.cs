@@ -24,6 +24,7 @@ public sealed class LightDownloader : IDisposable
     private const int MaxRedirects = 10;
     private const int MaxFileNameBytes = 255;
     private const string DefaultFileName = "download";
+    private static readonly TimeSpan MinIdleStallTimeout = TimeSpan.FromSeconds(3);
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
     private readonly LightDownloadConfig _config;
@@ -342,6 +343,8 @@ public sealed class LightDownloader : IDisposable
                             },
                             sessionDownloaded.Read,
                             () => Volatile.Read(ref activeSegments),
+                            () => GetStallTimeout(Volatile.Read(ref activeSegments),
+                                Volatile.Read(ref currentConcurrency)),
                             totalLength, stopwatch, probe.IfRange,
                             (rangeStart, rangeEnd) => AddCompletedRange(metadata, metadataPath, rangeStart, rangeEnd),
                             linkedCt).ConfigureAwait(false);
@@ -438,7 +441,8 @@ public sealed class LightDownloader : IDisposable
                     {
                         while (true)
                         {
-                            var read = await ReadWithStallTimeoutAsync(source, buffer, 0, ct).ConfigureAwait(false);
+                            var read = await ReadWithStallTimeoutAsync(source, buffer, 0, _config.NoDataTimeout, ct)
+                                .ConfigureAwait(false);
                             if (read == 0)
                                 break;
 
@@ -586,6 +590,7 @@ public sealed class LightDownloader : IDisposable
         Action<long> onBytesReceived,
         Func<long> getSessionDownloaded,
         Func<int> getActiveSegmentCount,
+        Func<TimeSpan> getStallTimeout,
         long totalLength,
         Stopwatch globalStopwatch,
         string? ifRange,
@@ -611,7 +616,8 @@ public sealed class LightDownloader : IDisposable
 
             while (currentOffset <= end)
             {
-                var read = await ReadWithStallTimeoutAsync(source, buffer, currentOffset, ct).ConfigureAwait(false);
+                var read = await ReadWithStallTimeoutAsync(source, buffer, currentOffset, getStallTimeout(), ct)
+                    .ConfigureAwait(false);
                 if (read == 0)
                     break;
 
@@ -679,10 +685,10 @@ public sealed class LightDownloader : IDisposable
     }
 
     private async ValueTask<int> ReadWithStallTimeoutAsync(Stream source, byte[] buffer, long offset,
-        CancellationToken ct)
+        TimeSpan stallTimeout, CancellationToken ct)
     {
         using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        readCts.CancelAfter(_config.NoDataTimeout);
+        readCts.CancelAfter(stallTimeout);
 
         try
         {
@@ -691,8 +697,25 @@ public sealed class LightDownloader : IDisposable
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             throw new SegmentRetryException(offset,
-                $"no data was received for {_config.NoDataTimeout.TotalSeconds:0.#}s; the connection will be requeued.");
+                $"no data was received for {stallTimeout.TotalSeconds:0.#}s; the connection will be requeued.");
         }
+    }
+
+    /// <summary>
+    /// A stalled connection is only worth waiting on while every worker is busy. Once some are
+    /// idle, a spare one picks the range up the moment it is requeued, so holding the full timeout
+    /// is dead air on an otherwise finished download - which is what the last few percent look like.
+    /// </summary>
+    private TimeSpan GetStallTimeout(int activeSegments, int concurrency)
+    {
+        if (activeSegments >= concurrency)
+            return _config.NoDataTimeout;
+
+        var shortened = _config.NoDataTimeout / 4;
+        if (shortened < MinIdleStallTimeout)
+            shortened = MinIdleStallTimeout;
+
+        return shortened < _config.NoDataTimeout ? shortened : _config.NoDataTimeout;
     }
 
     private static async ValueTask WriteAsync(FileStream dest, byte[] buffer, int count, string path,
