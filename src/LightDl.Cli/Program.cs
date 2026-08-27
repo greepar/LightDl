@@ -45,8 +45,13 @@ static async Task<int> RunAsync(string[] args)
 
     if (options.Verbose)
     {
-        config.RetryHandler = retry => Console.Error.WriteLine(
-            $"\nretry #{retry.Attempt} [{retry.Start}-{retry.End}] in {retry.Delay.TotalSeconds:F1}s: {retry.Error.Message}");
+        config.RetryHandler = retry =>
+        {
+            // The probe has no range yet, so it reports End as -1 rather than a byte offset.
+            var scope = retry.End < 0 ? "probe" : $"{retry.Start}-{retry.End}";
+            Console.Error.WriteLine(
+                $"\nretry #{retry.Attempt} [{scope}] in {retry.Delay.TotalSeconds:F1}s: {retry.Error.Message}");
+        };
     }
 
     if (options.ChunkCount is { } chunkCount)
@@ -111,7 +116,8 @@ static async Task<int> RunAsync(string[] args)
         if (lastProgressLength > 0)
             Console.Error.WriteLine();
 
-        Console.Error.WriteLine($"Download failed: {ex.Message}");
+        // A LightDownloadException already reads as a full sentence about the download.
+        Console.Error.WriteLine(ex is LightDownloadException ? ex.Message : $"Download failed: {ex.Message}");
         return 1;
     }
 }

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 
@@ -11,6 +12,7 @@ public sealed class FakeOrigin
 {
     private readonly List<RequestRecord> _requests = [];
     private readonly Lock _lock = new();
+    private readonly Dictionary<int, long> _peakReachedAt = [];
     private int _concurrentRequests;
     private int _peakConcurrentRequests;
 
@@ -52,6 +54,16 @@ public sealed class FakeOrigin
     /// <summary>Status returned for requests carrying this If-Range value, simulating an expired signed URL.</summary>
     public (int AfterRequests, HttpStatusCode Status)? ExpireAfter { get; set; }
 
+    /// <summary>
+    /// Answers 200 with a small HTML page instead of the requested range, the way a rate-limit or
+    /// anti-bot gate does. Starts once <c>AfterRequests</c> requests have been seen and lasts for
+    /// <c>Count</c> responses.
+    /// </summary>
+    public (int AfterRequests, int Count)? GatePage { get; set; }
+
+    /// <summary>Answers 429 for <c>Count</c> requests once <c>AfterRequests</c> have been seen.</summary>
+    public (int AfterRequests, int Count)? ThrottleAfter { get; set; }
+
     public IReadOnlyList<RequestRecord> Requests
     {
         get
@@ -70,6 +82,13 @@ public sealed class FakeOrigin
         }
     }
 
+    /// <summary>Stopwatch timestamp when this many requests were first in flight at once, if ever.</summary>
+    public long? PeakReachedAt(int concurrency)
+    {
+        lock (_lock)
+            return _peakReachedAt.TryGetValue(concurrency, out var timestamp) ? timestamp : null;
+    }
+
     public LightDownloadConfig Configure(LightDownloadConfig config)
     {
         config.HttpMessageHandlerFactory = () => new Handler(this);
@@ -86,17 +105,87 @@ public sealed class FakeOrigin
         {
             _requests.Add(new RequestRecord(range?.From, range?.To, ifRange, acceptEncoding));
             _concurrentRequests++;
-            _peakConcurrentRequests = Math.Max(_peakConcurrentRequests, _concurrentRequests);
+            if (_concurrentRequests > _peakConcurrentRequests)
+            {
+                _peakConcurrentRequests = _concurrentRequests;
+                _peakReachedAt[_concurrentRequests] = Stopwatch.GetTimestamp();
+            }
         }
 
+        HttpResponseMessage response;
         try
         {
-            return await BuildResponseAsync(request, range, ifRange, ct).ConfigureAwait(false);
+            response = await BuildResponseAsync(request, range, ifRange, ct).ConfigureAwait(false);
         }
-        finally
+        catch
         {
-            lock (_lock)
-                _concurrentRequests--;
+            Release();
+            throw;
+        }
+
+        // A connection is open until its body has been read, not until its headers exist. Counting
+        // only the latter makes every concurrency assertion a race against instant local responses.
+        if (response.Content is StreamContent)
+        {
+            var body = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            var tracked = new StreamContent(new TrackedStream(body, Release));
+            foreach (var header in response.Content.Headers)
+                tracked.Headers.TryAddWithoutValidation(header.Key, header.Value);
+
+            response.Content = tracked;
+        }
+        else
+        {
+            Release();
+        }
+
+        return response;
+    }
+
+    private void Release()
+    {
+        lock (_lock)
+            _concurrentRequests--;
+    }
+
+    /// <summary>Holds a connection slot open until the caller finishes reading the body.</summary>
+    private sealed class TrackedStream(Stream inner, Action onClosed) : Stream
+    {
+        private int _closed;
+
+        public override bool CanRead => inner.CanRead;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => inner.Length;
+
+        public override long Position
+        {
+            get => inner.Position;
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+            => inner.ReadAsync(buffer, ct);
+
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct)
+            => inner.ReadAsync(buffer, offset, count, ct);
+
+        public override void Flush() => inner.Flush();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && Interlocked.Exchange(ref _closed, 1) == 0)
+            {
+                inner.Dispose();
+                onClosed();
+            }
+
+            base.Dispose(disposing);
         }
     }
 
@@ -117,6 +206,47 @@ public sealed class FakeOrigin
 
         if (range is not null && FailRangeAt is { } failRange && range.From == failRange.Start)
             return new HttpResponseMessage(failRange.Status) { RequestMessage = request };
+
+        if (ThrottleAfter is { } limit)
+        {
+            var reject = false;
+            lock (_lock)
+            {
+                if (limit.Count > 0 && _requests.Count > limit.AfterRequests)
+                {
+                    ThrottleAfter = (limit.AfterRequests, limit.Count - 1);
+                    reject = true;
+                }
+            }
+
+            if (reject)
+                return new HttpResponseMessage(HttpStatusCode.TooManyRequests) { RequestMessage = request };
+        }
+
+        if (GatePage is { } gate)
+        {
+            var serveGate = false;
+            lock (_lock)
+            {
+                if (gate.Count > 0 && _requests.Count > gate.AfterRequests)
+                {
+                    GatePage = (gate.AfterRequests, gate.Count - 1);
+                    serveGate = true;
+                }
+            }
+
+            if (serveGate)
+            {
+                var page = "<html><head><title>Security check</title></head><body>hold on</body></html>"u8.ToArray();
+                var gated = new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    RequestMessage = request,
+                    Content = new ByteArrayContent(page)
+                };
+                gated.Content.Headers.ContentType = new MediaTypeHeaderValue("text/html") { CharSet = "utf-8" };
+                return gated;
+            }
+        }
 
         if (ExpireAfter is { } expiry)
         {
@@ -193,7 +323,11 @@ public sealed class FakeOrigin
         return Task.FromResult<Stream>(new SlowStream(slice, BodyDelay));
     }
 
-    public sealed record RequestRecord(long? From, long? To, string? IfRange, string AcceptEncoding);
+    public sealed record RequestRecord(long? From, long? To, string? IfRange, string AcceptEncoding)
+    {
+        /// <summary>Stopwatch timestamp of arrival, for asserting on when connections opened.</summary>
+        public long Timestamp { get; init; } = Stopwatch.GetTimestamp();
+    }
 
     private sealed class Handler(FakeOrigin origin) : HttpMessageHandler
     {

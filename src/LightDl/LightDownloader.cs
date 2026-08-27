@@ -25,6 +25,12 @@ public sealed class LightDownloader : IDisposable
     private const int MaxFileNameBytes = 255;
     private const string DefaultFileName = "download";
     private static readonly TimeSpan MinIdleStallTimeout = TimeSpan.FromSeconds(3);
+
+    /// <summary>Ceiling on the staggered connection ramp, so a large worker count still starts promptly.</summary>
+    private static readonly TimeSpan MaxRampUpDelay = TimeSpan.FromSeconds(2);
+
+    /// <summary>Challenge pages are a few KB of HTML; a real download that small is not worth guarding.</summary>
+    private const long MaxChallengePageBytes = 1024 * 1024;
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
 
     private readonly LightDownloadConfig _config;
@@ -277,8 +283,20 @@ public sealed class LightDownloader : IDisposable
         var sessionDownloaded = new AtomicLong();
         var currentConcurrency = Math.Min(_config.ChunkCount, _config.MaxChunkCount);
         var currentSegmentSize = CalculateStableSegmentSize(totalLength, currentConcurrency);
+        // Throttle recovery may only climb back to what the caller actually asked for. Without
+        // dynamic concurrency that is ChunkCount, and no worker exists above it to use the slot.
+        var maxConcurrency = _config.EnableDynamicConcurrency ? _config.MaxChunkCount : currentConcurrency;
         var stopwatch = Stopwatch.StartNew();
         var failure = new FailureState();
+        var throttle = _config.EnableThrottleBackoff
+            ? new ThrottleController(
+                currentConcurrency,
+                Math.Min(_config.MinChunkCount, currentConcurrency),
+                _config.ThrottleBackoffDelay,
+                _config.ThrottleRecoveryInterval,
+                () => Volatile.Read(ref currentConcurrency),
+                value => Volatile.Write(ref currentConcurrency, value))
+            : null;
 
         // A segment that fails for good must stop the whole download immediately: without this the
         // remaining workers keep pulling bytes for a download that is already doomed.
@@ -295,6 +313,8 @@ public sealed class LightDownloader : IDisposable
             value => Volatile.Write(ref currentConcurrency, value),
             () => Interlocked.Read(ref currentSegmentSize),
             value => Interlocked.Exchange(ref currentSegmentSize, value),
+            throttle,
+            maxConcurrency,
             stalledFor =>
             {
                 if (failure.TrySet(new LightDownloadException(
@@ -309,9 +329,23 @@ public sealed class LightDownloader : IDisposable
             var index = workerIndex;
             workers[index] = Task.Run(async () =>
             {
+                // Opening every connection in the same instant is what per-IP rate limiters and
+                // anti-bot gates react to. Staggering the first request costs a second on a long
+                // transfer and nothing on a short one, where the early workers finish the job.
+                if (index > 0 && _config.ConnectionRampUpDelay > TimeSpan.Zero)
+                {
+                    var ramp = Math.Min(
+                        index * _config.ConnectionRampUpDelay.TotalMilliseconds,
+                        MaxRampUpDelay.TotalMilliseconds);
+                    await Task.Delay(TimeSpan.FromMilliseconds(ramp), linkedCt).ConfigureAwait(false);
+                }
+
                 while (true)
                 {
                     linkedCt.ThrowIfCancellationRequested();
+
+                    if (throttle is not null)
+                        await throttle.WaitAsync(linkedCt).ConfigureAwait(false);
 
                     if (index >= Volatile.Read(ref currentConcurrency))
                     {
@@ -345,7 +379,7 @@ public sealed class LightDownloader : IDisposable
                             () => Volatile.Read(ref activeSegments),
                             () => GetStallTimeout(Volatile.Read(ref activeSegments),
                                 Volatile.Read(ref currentConcurrency)),
-                            totalLength, stopwatch, probe.IfRange,
+                            totalLength, stopwatch, probe.IfRange, probe.ContentType,
                             (rangeStart, rangeEnd) => AddCompletedRange(metadata, metadataPath, rangeStart, rangeEnd),
                             linkedCt).ConfigureAwait(false);
                     }
@@ -370,6 +404,9 @@ public sealed class LightDownloader : IDisposable
 
                         if (nextStart <= segment.End)
                             retryQueue.Enqueue(new DownloadSegment(nextStart, segment.End, segment.RetryCount + 1));
+
+                        if (ex is SegmentRetryException { Throttled: true } throttled)
+                            throttle?.Trip(throttled.RetryAfter);
 
                         var delay = GetRetryDelay(segment.RetryCount, (ex as SegmentRetryException)?.RetryAfter);
                         NotifyRetry(segment.Start, segment.End, segment.RetryCount + 1, delay, ex);
@@ -532,7 +569,8 @@ public sealed class LightDownloader : IDisposable
                 var retryAfter = GetRetryAfter(response);
                 if (IsRetryableStatus(statusCode))
                     throw new SegmentRetryException(0,
-                        $"the server answered {(int)statusCode} {statusCode} to the initial request.", retryAfter);
+                        $"the server answered {(int)statusCode} {statusCode} to the initial request.", retryAfter,
+                        throttled: IsThrottleStatus(statusCode));
 
                 throw new FatalDownloadException(
                     $"The server answered {(int)statusCode} {statusCode} to the initial request.");
@@ -556,6 +594,14 @@ public sealed class LightDownloader : IDisposable
 
             if (size < 0)
                 supportsRange = false;
+
+            // A gated origin answers 200 with its challenge page. Accepting it here would save a few
+            // kilobytes of HTML under the requested file's name and report success.
+            if (_config.DetectChallengePages && IsChallengePage(response))
+                throw new SegmentRetryException(0,
+                    "the server answered with a challenge or rate-limit page instead of the file; " +
+                    "any session cookie may need refreshing.",
+                    GetRetryAfter(response), throttled: true);
 
             var downloadUri = response.RequestMessage?.RequestUri ?? url;
             var eTag = response.Headers.ETag;
@@ -594,6 +640,7 @@ public sealed class LightDownloader : IDisposable
         long totalLength,
         Stopwatch globalStopwatch,
         string? ifRange,
+        string? expectedContentType,
         Action<long, long> onRangeCompleted,
         CancellationToken ct)
     {
@@ -605,7 +652,7 @@ public sealed class LightDownloader : IDisposable
 
         try
         {
-            using var response = await SendRangeRequestAsync(target, start, end, totalLength, ifRange, ct)
+            using var response = await SendRangeRequestAsync(target, start, end, totalLength, ifRange, expectedContentType, ct)
                 .ConfigureAwait(false);
 
             await using var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
@@ -812,6 +859,8 @@ public sealed class LightDownloader : IDisposable
         Action<int> setConcurrency,
         Func<long> getSegmentSize,
         Action<long> setSegmentSize,
+        ThrottleController? throttle,
+        int maxConcurrency,
         Action<TimeSpan> onStalled)
     {
         var lastBytes = getDownloaded();
@@ -838,8 +887,9 @@ public sealed class LightDownloader : IDisposable
 
             if (DateTimeOffset.UtcNow - lastAdapt >= _config.AdaptInterval)
             {
+                throttle?.Recover(maxConcurrency);
                 AdaptDownloadParameters(speed, previousSpeed, getConcurrency, setConcurrency, getSegmentSize,
-                    setSegmentSize);
+                    setSegmentSize, Math.Min(throttle?.Ceiling ?? maxConcurrency, maxConcurrency));
                 previousSpeed = speed;
                 lastAdapt = DateTimeOffset.UtcNow;
             }
@@ -870,7 +920,8 @@ public sealed class LightDownloader : IDisposable
         Func<int> getConcurrency,
         Action<int> setConcurrency,
         Func<long> getSegmentSize,
-        Action<long> setSegmentSize)
+        Action<long> setSegmentSize,
+        int concurrencyCeiling)
     {
         if (previousSpeed <= 0 || speed <= 0)
             return;
@@ -880,7 +931,7 @@ public sealed class LightDownloader : IDisposable
 
         if (speed > previousSpeed * 1.08)
         {
-            if (_config.EnableDynamicConcurrency && concurrency < _config.MaxChunkCount)
+            if (_config.EnableDynamicConcurrency && concurrency < concurrencyCeiling)
                 setConcurrency(concurrency + 1);
 
             if (_config.EnableDynamicSegmentSize && segmentSize < _config.MaxSegmentSize)
@@ -1277,6 +1328,7 @@ public sealed class LightDownloader : IDisposable
         long end,
         long totalLength,
         string? ifRange,
+        string? expectedContentType,
         CancellationToken ct)
     {
         while (true)
@@ -1321,13 +1373,24 @@ public sealed class LightDownloader : IDisposable
                 continue;
             }
 
-            // 200 in answer to If-Range means the validator no longer matches: the file changed.
-            if (response.StatusCode == HttpStatusCode.OK && ifRange is not null)
+            if (response.StatusCode == HttpStatusCode.OK)
             {
+                var interstitial = IsInterstitialResponse(response, end - start + 1, expectedContentType);
+                var gateRetryAfter = GetRetryAfter(response);
                 response.Dispose();
-                throw new FatalDownloadException(
-                    "The remote file changed while it was being downloaded; the partial data is no longer valid.",
-                    discardPartialData: true);
+
+                if (interstitial)
+                    throw new SegmentRetryException(start,
+                        "the server answered 200 with a challenge or error page instead of the requested range.",
+                        gateRetryAfter, throttled: true);
+
+                // 200 in answer to If-Range means the validator no longer matches: the file changed.
+                if (ifRange is not null)
+                    throw new FatalDownloadException(
+                        "The remote file changed while it was being downloaded; the partial data is no longer valid.",
+                        discardPartialData: true);
+
+                throw new FatalDownloadException("The server answered 200 OK to a range request.");
             }
 
             var statusCode = response.StatusCode;
@@ -1336,7 +1399,8 @@ public sealed class LightDownloader : IDisposable
 
             if (IsRetryableStatus(statusCode))
                 throw new SegmentRetryException(start,
-                    $"the server answered {(int)statusCode} {statusCode} to a range request.", retryAfter);
+                    $"the server answered {(int)statusCode} {statusCode} to a range request.", retryAfter,
+                    throttled: IsThrottleStatus(statusCode));
 
             throw new FatalDownloadException(
                 $"The server answered {(int)statusCode} {statusCode} to a range request.",
@@ -1380,11 +1444,51 @@ public sealed class LightDownloader : IDisposable
             }
 
             if (IsRetryableStatus(statusCode))
-                throw new SegmentRetryException(0, $"the server answered {(int)statusCode} {statusCode}.", retryAfter);
+                throw new SegmentRetryException(0, $"the server answered {(int)statusCode} {statusCode}.", retryAfter,
+                    throttled: IsThrottleStatus(statusCode));
 
             throw new FatalDownloadException($"The server answered {(int)statusCode} {statusCode}.");
         }
     }
+
+    /// <summary>
+    /// A 200 answering a range request is supposed to carry the whole entity. Rate-limit and
+    /// anti-bot gates answer 200 with a small HTML page instead, and reading that as "the file
+    /// changed" throws away every byte downloaded so far. Neither signal is conclusive alone, so a
+    /// body too small to be the requested range, or one that turned into HTML when the file was
+    /// not HTML, is treated as a gate and retried rather than discarded.
+    /// </summary>
+    private bool IsInterstitialResponse(
+        HttpResponseMessage response,
+        long requestedLength,
+        string? expectedContentType)
+    {
+        // A body shorter than the range that was asked for cannot be that range, whatever it claims.
+        if (response.Content.Headers.ContentLength is { } length && length < requestedLength)
+            return true;
+
+        return _config.DetectChallengePages &&
+               IsHtml(response.Content.Headers.ContentType?.MediaType) &&
+               !IsHtml(expectedContentType);
+    }
+
+    private static bool IsChallengePage(HttpResponseMessage response) =>
+        response.StatusCode == HttpStatusCode.OK &&
+        IsHtml(response.Content.Headers.ContentType?.MediaType) &&
+        response.Content.Headers.ContentLength is { } length &&
+        length <= MaxChallengePageBytes;
+
+    private static bool IsHtml(string? contentType) =>
+        contentType is not null && contentType.Contains("html", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Statuses that mean "you are asking too often" rather than "something broke". These drive the
+    /// connection count down; the rest are retried without touching it.
+    /// </summary>
+    private static bool IsThrottleStatus(HttpStatusCode statusCode) => statusCode is
+        HttpStatusCode.TooManyRequests or
+        HttpStatusCode.ServiceUnavailable or
+        (HttpStatusCode)509;
 
     private static bool IsRetryableStatus(HttpStatusCode statusCode) => statusCode is
         HttpStatusCode.RequestTimeout or
@@ -1836,6 +1940,103 @@ public sealed class LightDownloader : IDisposable
             config.MaxRetryDelay = config.RetryBaseDelay;
         if (config.MetadataFlushInterval < TimeSpan.Zero)
             config.MetadataFlushInterval = TimeSpan.Zero;
+
+        if (config.ConnectionRampUpDelay < TimeSpan.Zero)
+            config.ConnectionRampUpDelay = TimeSpan.Zero;
+        if (config.ThrottleBackoffDelay < TimeSpan.Zero)
+            config.ThrottleBackoffDelay = TimeSpan.Zero;
+        if (config.ThrottleRecoveryInterval < TimeSpan.Zero)
+            config.ThrottleRecoveryInterval = TimeSpan.Zero;
+    }
+
+    /// <summary>
+    /// AIMD, the same shape TCP uses for congestion: a throttle signal halves the connection
+    /// ceiling at once and pauses every worker, and the ceiling only creeps back one connection at
+    /// a time after the origin has stayed quiet. Reacting per segment instead leaves the other
+    /// workers hammering the limiter that just fired, which is what re-trips it.
+    /// </summary>
+    private sealed class ThrottleController(
+        int initialConcurrency,
+        int floor,
+        TimeSpan backoffDelay,
+        TimeSpan recoveryInterval,
+        Func<int> getConcurrency,
+        Action<int> setConcurrency)
+    {
+        private readonly Lock _lock = new();
+        private readonly int _floor = Math.Max(floor, 1);
+        private int _ceiling = initialConcurrency;
+        private long _resumeAt;
+        private long _lastTripAt = Stopwatch.GetTimestamp();
+
+        /// <summary>Upper bound the throughput-based adapter must not climb past.</summary>
+        public int Ceiling
+        {
+            get
+            {
+                lock (_lock)
+                    return _ceiling;
+            }
+        }
+
+        public void Trip(TimeSpan? retryAfter)
+        {
+            var pause = retryAfter is { } supplied && supplied > backoffDelay ? supplied : backoffDelay;
+            var now = Stopwatch.GetTimestamp();
+
+            lock (_lock)
+            {
+                _lastTripAt = now;
+
+                var deadline = now + (long)(pause.TotalSeconds * Stopwatch.Frequency);
+                if (deadline > _resumeAt)
+                    _resumeAt = deadline;
+
+                var reduced = Math.Max(_ceiling / 2, _floor);
+                if (reduced >= _ceiling)
+                    return;
+
+                _ceiling = reduced;
+            }
+
+            if (getConcurrency() > Ceiling)
+                setConcurrency(Ceiling);
+        }
+
+        /// <summary>Called on the adapt tick: one connection back per quiet interval.</summary>
+        public void Recover(int hardCeiling)
+        {
+            if (recoveryInterval <= TimeSpan.Zero)
+                return;
+
+            lock (_lock)
+            {
+                if (_ceiling >= hardCeiling ||
+                    Stopwatch.GetElapsedTime(_lastTripAt) < recoveryInterval)
+                    return;
+
+                _ceiling++;
+                _lastTripAt = Stopwatch.GetTimestamp();
+            }
+        }
+
+        public async Task WaitAsync(CancellationToken ct)
+        {
+            while (true)
+            {
+                TimeSpan remaining;
+                lock (_lock)
+                {
+                    var now = Stopwatch.GetTimestamp();
+                    if (_resumeAt <= now)
+                        return;
+
+                    remaining = TimeSpan.FromSeconds((_resumeAt - now) / (double)Stopwatch.Frequency);
+                }
+
+                await Task.Delay(remaining, ct).ConfigureAwait(false);
+            }
+        }
     }
 
     private sealed class RangeAllocator(IEnumerable<DownloadRange> ranges)
@@ -1975,7 +2176,8 @@ public sealed class LightDownloader : IDisposable
         long nextStart,
         string message,
         TimeSpan? retryAfter = null,
-        Exception? innerException = null)
+        Exception? innerException = null,
+        bool throttled = false)
         : Exception(message, innerException)
     {
         public SegmentRetryException(long nextStart, string message, Exception? innerException)
@@ -1986,6 +2188,9 @@ public sealed class LightDownloader : IDisposable
         public long NextStart { get; } = nextStart;
 
         public TimeSpan? RetryAfter { get; } = retryAfter;
+
+        /// <summary>The origin said "too often", not "something broke": back the whole download off.</summary>
+        public bool Throttled { get; } = throttled;
     }
 
     /// <summary>A permanent failure: retrying cannot help, so the whole download stops now.</summary>

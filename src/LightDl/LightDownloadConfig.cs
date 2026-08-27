@@ -33,6 +33,42 @@ public class LightDownloadConfig
     /// <summary>Enables dynamic segment sizing. Disabled by default.</summary>
     public bool EnableDynamicSegmentSize { get; set; }
 
+    /// <summary>
+    /// Delay between starting one worker's first connection and the next. Opening every connection
+    /// in the same instant is what per-IP rate limiters and anti-bot gates react to, so the workers
+    /// ramp up instead. The total ramp is capped at two seconds. Set to zero to disable.
+    /// Default is 50 ms.
+    /// </summary>
+    public TimeSpan ConnectionRampUpDelay { get; set; } = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>
+    /// Halves the worker count whenever the origin signals throttling (429, 503, or a challenge
+    /// page served in place of the requested range), then lets it climb back one worker at a time
+    /// once the origin goes quiet. Independent of <see cref="EnableDynamicConcurrency" />, which
+    /// only reacts to throughput. Enabled by default.
+    /// </summary>
+    public bool EnableThrottleBackoff { get; set; } = true;
+
+    /// <summary>
+    /// How long every worker pauses when the origin signals throttling. A server-supplied
+    /// Retry-After wins when it is longer. Default is 2 seconds.
+    /// </summary>
+    public TimeSpan ThrottleBackoffDelay { get; set; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// How long the origin must stay quiet before the worker count climbs back by one.
+    /// Default is 15 seconds.
+    /// </summary>
+    public TimeSpan ThrottleRecoveryInterval { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Treats a small HTML body answered with 200 as a rate-limit or anti-bot challenge page rather
+    /// than the file, retrying instead of saving it. Without this a gated origin yields a few
+    /// kilobytes of HTML named after the file the caller asked for, reported as a success. Turn it
+    /// off when the download really is an HTML page. Enabled by default.
+    /// </summary>
+    public bool DetectChallengePages { get; set; } = true;
+
     /// <summary>Interval for dynamic concurrency and segment-size adaptation. Default is 5 seconds.</summary>
     public TimeSpan AdaptInterval { get; set; } = TimeSpan.FromSeconds(5);
 
@@ -154,6 +190,11 @@ public class LightDownloadConfig
             MinSegmentSize = MinSegmentSize,
             MaxSegmentSize = MaxSegmentSize,
             EnableDynamicSegmentSize = EnableDynamicSegmentSize,
+            ConnectionRampUpDelay = ConnectionRampUpDelay,
+            EnableThrottleBackoff = EnableThrottleBackoff,
+            ThrottleBackoffDelay = ThrottleBackoffDelay,
+            ThrottleRecoveryInterval = ThrottleRecoveryInterval,
+            DetectChallengePages = DetectChallengePages,
             AdaptInterval = AdaptInterval,
             Timeout = Timeout,
             ConnectTimeout = ConnectTimeout,

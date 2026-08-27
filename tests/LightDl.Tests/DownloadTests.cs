@@ -34,7 +34,10 @@ public sealed class DownloadTests : IDisposable
         MaxRetryDelay = TimeSpan.FromMilliseconds(20),
         MaxRetry = 5,
         FileConflictPolicy = LightDownloadFileConflictPolicy.Overwrite,
-        CheckFreeSpace = false
+        CheckFreeSpace = false,
+        // Staggered starts would make the observed connection count depend on timing.
+        ConnectionRampUpDelay = TimeSpan.Zero,
+        ThrottleBackoffDelay = TimeSpan.FromMilliseconds(5)
     });
 
     // --- Regression: an explicit ChunkCount must not be raised by MinChunkCount ------------------
@@ -539,5 +542,138 @@ public sealed class DownloadTests : IDisposable
         Assert.Equal(100d, final.ProgressPercentage, 5);
         // 0 B/s at 100% reads as a stall; the last report must carry a real rate.
         Assert.True(final.Speed > 0, $"final progress reported {final.Speed} B/s");
+    }
+
+    // --- Regression: a rate-limit gate is not a changed file -------------------------------------
+
+    [Fact]
+    public async Task A_Challenge_Page_Is_Retried_Instead_Of_Discarding_The_Download()
+    {
+        // A 200 carrying a few hundred bytes of HTML is a gate, not a new version of a 4 MB file.
+        // Reading it as "the file changed" used to delete every byte already on disk.
+        var content = MakeContent(4 * 1024 * 1024);
+        var origin = new FakeOrigin(content) { ETag = "\"v1\"", GatePage = (3, 4) };
+
+        var config = BaseConfig(origin);
+        // The assertion is that the gate is survivable, not that it fits in a small retry budget.
+        config.MaxRetry = 20;
+        using var downloader = new LightDownloader(config);
+        var result = await downloader.DownloadAsync(LightDownloadRequest.ToFile(Url, Path("movie.bin")));
+
+        Assert.Equal(content, await File.ReadAllBytesAsync(result.FilePath));
+    }
+
+    [Fact]
+    public async Task A_Challenge_Page_Leaves_Resume_Metadata_Behind_When_Retries_Run_Out()
+    {
+        var content = MakeContent(4 * 1024 * 1024);
+        var destination = Path("movie.bin");
+        var origin = new FakeOrigin(content) { ETag = "\"v1\"", GatePage = (3, 10_000) };
+
+        var config = BaseConfig(origin);
+        config.MaxRetry = 1;
+        using var downloader = new LightDownloader(config);
+
+        await Assert.ThrowsAsync<LightDownloadException>(
+            () => downloader.DownloadAsync(LightDownloadRequest.ToFile(Url, destination)));
+
+        // The whole point of the fix: what was already downloaded survives for the next run.
+        Assert.True(File.Exists(destination + ".lightdl"), "the partial file was deleted");
+    }
+
+    [Fact]
+    public async Task A_Challenge_Page_At_Probe_Time_Is_Not_Saved_As_The_File()
+    {
+        // The gate answers before the real size is ever known. Saving its 74 bytes of HTML under the
+        // requested name and returning success is the worst possible outcome: a silent wrong file.
+        var content = MakeContent(1024 * 1024);
+        var destination = Path("movie.bin");
+        var origin = new FakeOrigin(content) { GatePage = (0, 10_000) };
+
+        var config = BaseConfig(origin);
+        config.MaxRetry = 2;
+        using var downloader = new LightDownloader(config);
+
+        var error = await Assert.ThrowsAsync<LightDownloadException>(
+            () => downloader.DownloadAsync(LightDownloadRequest.ToFile(Url, destination)));
+
+        Assert.Contains("challenge", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.False(File.Exists(destination), "the challenge page was saved as the download");
+    }
+
+    [Fact]
+    public async Task An_Html_Download_Still_Works_When_Detection_Is_Off()
+    {
+        var content = MakeContent(1024 * 1024);
+        var origin = new FakeOrigin(content) { GatePage = (0, 10_000) };
+
+        var config = BaseConfig(origin);
+        config.DetectChallengePages = false;
+        config.MaxRetry = 0;
+        using var downloader = new LightDownloader(config);
+
+        var result = await downloader.DownloadAsync(LightDownloadRequest.ToFile(Url, Path("page.html")));
+
+        Assert.True(File.Exists(result.FilePath));
+    }
+
+    [Fact]
+    public async Task Throttling_Reduces_The_Connection_Count()
+    {
+        var content = MakeContent(8 * 1024 * 1024);
+        var origin = new FakeOrigin(content)
+        {
+            ETag = "\"v1\"",
+            BodyDelay = TimeSpan.FromMilliseconds(2),
+            // Past the probe, so the download starts at full width and is then pushed back down.
+            ThrottleAfter = (1, 8)
+        };
+
+        var config = BaseConfig(origin);
+        config.ChunkCount = 8;
+        config.SegmentSize = 256 * 1024;
+        config.MaxSegmentSize = 256 * 1024;
+        config.MinChunkCount = 2;
+        // Eight rejections must not be able to exhaust one segment's budget under a loaded CPU.
+        config.MaxRetry = 20;
+        using var downloader = new LightDownloader(config);
+
+        var result = await downloader.DownloadAsync(LightDownloadRequest.ToFile(Url, Path("movie.bin")));
+
+        Assert.Equal(content, await File.ReadAllBytesAsync(result.FilePath));
+        // Halving on every 429 must pull the peak below the 8 the caller asked for.
+        Assert.True(origin.PeakConcurrentRequests < 8,
+            $"peak stayed at {origin.PeakConcurrentRequests} despite repeated 429s");
+    }
+
+    [Fact]
+    public async Task Ramping_Up_Staggers_The_First_Connections()
+    {
+        var content = MakeContent(4 * 1024 * 1024);
+        // Bodies must outlast the ramp, otherwise early workers finish before late ones start and
+        // the connections never overlap for reasons that have nothing to do with the ramp.
+        var origin = new FakeOrigin(content) { BodyDelay = TimeSpan.FromMilliseconds(60) };
+
+        var config = BaseConfig(origin);
+        config.ChunkCount = 8;
+        config.SegmentSize = 256 * 1024;
+        config.MaxSegmentSize = 256 * 1024;
+        config.ConnectionRampUpDelay = TimeSpan.FromMilliseconds(80);
+        using var downloader = new LightDownloader(config);
+
+        var result = await downloader.DownloadAsync(LightDownloadRequest.ToFile(Url, Path("movie.bin")));
+
+        Assert.Equal(content, await File.ReadAllBytesAsync(result.FilePath));
+
+        // Peak concurrency is not the observable: once the ramp is done all eight do run together.
+        // What the ramp promises is that reaching that width takes time. Scheduling delay can only
+        // stretch the window, never compress it, so the bound is one-sided and safe under load.
+        var firstRange = origin.Requests.First(r => r.To > r.From).Timestamp;
+        var reachedFullWidth = origin.PeakReachedAt(8);
+
+        Assert.NotNull(reachedFullWidth);
+        var window = Stopwatch.GetElapsedTime(firstRange, reachedFullWidth.Value);
+        Assert.True(window >= TimeSpan.FromMilliseconds(300),
+            $"all eight connections were open within {window.TotalMilliseconds:F0} ms despite an 80 ms ramp");
     }
 }

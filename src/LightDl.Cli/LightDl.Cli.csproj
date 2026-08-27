@@ -5,7 +5,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <Version>0.4.2</Version>
+    <Version>0.4.3</Version>
     <PublishAot>true</PublishAot>
     <StripSymbols>true</StripSymbols>
   </PropertyGroup>
