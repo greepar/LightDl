@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build assets for
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -86,11 +95,12 @@ jobs:
         if: ${{ ! matrix.container_build }}
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           dotnet publish src/LightDl.Cli/LightDl.Cli.csproj \
             --configuration Release \
             --runtime "${{ matrix.rid }}" \
             --output publish \
+            -p:TargetFramework=net10.0 \
             -p:TargetFrameworks=net10.0 \
             -p:Version="$VERSION" \
             -p:ContinuousIntegrationBuild=true
@@ -99,7 +109,7 @@ jobs:
         if: matrix.container_build
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           docker run --rm \
             --volume "${GITHUB_WORKSPACE}:/src" \
             --workdir /src \
@@ -109,6 +119,7 @@ jobs:
               --configuration Release \
               --runtime "${{ matrix.rid }}" \
               --output publish \
+              -p:TargetFramework=net10.0 \
               -p:TargetFrameworks=net10.0 \
               -p:Version="$RELEASE_VERSION" \
               -p:ContinuousIntegrationBuild=true && chmod -R a+rwX publish'
@@ -150,7 +161,7 @@ jobs:
       - name: Pack NuGet package
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${RELEASE_TAG#v}"
           dotnet pack src/LightDl/LightDl.csproj \
             --configuration Release \
             --output packages \
@@ -180,5 +191,6 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           files: release-assets/*
