@@ -23,8 +23,8 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: |
-            10.0.x
-            11.0.100-rc.1.26425.128
+            10.0.402
+            11.0.100-rc.2.26504.105
 
       - name: Restore
         run: dotnet restore src/LightDl/LightDl.csproj
