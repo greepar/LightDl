@@ -7,6 +7,11 @@ on:
   pull_request:
     branches: [ master, main ]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag to publish to NuGet (for example v0.4.6); empty builds CI artifacts only"
+        required: false
+        type: string
 
 jobs:
   pack:
@@ -18,6 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -35,16 +42,38 @@ jobs:
       - name: Resolve package version
         id: version
         shell: pwsh
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
-          if ($env:GITHUB_REF -like 'refs/tags/v*') {
-            $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $releaseTag = $env:INPUT_RELEASE_TAG
+          if (-not $releaseTag -and $env:GITHUB_REF -like 'refs/tags/v*') {
+            $releaseTag = $env:GITHUB_REF_NAME
+          }
+          if ($releaseTag) {
+            if ($releaseTag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+              throw "Expected an existing stable release tag such as v0.4.6."
+            }
+            $version = $releaseTag.Substring(1)
+            "publish=true" >> $env:GITHUB_OUTPUT
           } else {
             $version = "0.1.0-ci.$env:GITHUB_RUN_NUMBER"
+            "publish=false" >> $env:GITHUB_OUTPUT
           }
           "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$releaseTag" >> $env:GITHUB_OUTPUT
 
       - name: Pack
-        run: dotnet pack src/LightDl/LightDl.csproj --configuration Release --no-build --output artifacts /p:PackageVersion=${{ steps.version.outputs.version }}
+        if: inputs.release_tag == ''
+        run: dotnet pack src/LightDl/LightDl.csproj --configuration Release --output artifacts /p:PackageVersion=${{ steps.version.outputs.version }}
+
+      - name: Reuse the existing release package
+        if: inputs.release_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        shell: pwsh
+        run: gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --pattern "LightDl.$env:PACKAGE_VERSION.nupkg" --dir artifacts
 
       - name: Verify MsQuic package options
         shell: pwsh
@@ -58,21 +87,15 @@ jobs:
           name: nuget-package
           path: artifacts/*.nupkg
 
-      - name: Upload package to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/*.nupkg
-
       - name: NuGet login
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.version.outputs.publish == 'true'
         id: login
         uses: NuGet/login@v1
         with:
           user: greepar
 
       - name: Publish to NuGet
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: steps.version.outputs.publish == 'true'
         shell: pwsh
         run: |
           $package = Get-ChildItem -Path artifacts -Filter *.nupkg | Select-Object -First 1
