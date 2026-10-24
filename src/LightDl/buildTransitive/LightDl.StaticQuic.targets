@@ -7,6 +7,9 @@
   </PropertyGroup>
   <ItemGroup>
     <DirectPInvoke Include="__Internal" />
+    <!-- Link this first so the old shim embedded in the combined archive is never extracted. -->
+    <NativeLibrary Include="$(_LightDlQuicRoot)native/net11/$(RuntimeIdentifier)/libSystem.Security.Cryptography.Native.OpenSsl.a"
+                   Condition="'$(TargetFramework)' == 'net11.0' and $(RuntimeIdentifier.StartsWith('linux'))" />
     <NativeLibrary Include="$(_LightDlQuicRoot)native/$(RuntimeIdentifier)/libmsquic.a" />
   </ItemGroup>
   <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('linux'))">
@@ -26,6 +29,8 @@
            Text="Unsupported static MsQuic RID: $(RuntimeIdentifier). Specify a supported RID (x64/arm64 Windows, Linux, Linux musl, or macOS)." />
     <Error Condition="$(RuntimeIdentifier.StartsWith('osx')) and '$(AppleMinOSVersion)' != '' and $([MSBuild]::VersionLessThan('$(AppleMinOSVersion)', '14.0'))"
            Text="The supplied macOS MsQuic archives require AppleMinOSVersion 14.0 or later." />
+    <Error Condition="'$(TargetFramework)' == 'net11.0' and $(RuntimeIdentifier.StartsWith('linux')) and !Exists('$(_LightDlQuicRoot)native/net11/$(RuntimeIdentifier)/libSystem.Security.Cryptography.Native.OpenSsl.a')"
+           Text="The .NET 11 static crypto shim is missing for $(RuntimeIdentifier). Run eng/build-net11-crypto.sh or use the complete NuGet package built by CI." />
     <Error Condition="'$(Http3Support)' == 'false'" Text="LightDlStaticQuic requires Http3Support=true." />
     <Error Condition="$(RuntimeIdentifier.StartsWith('win')) and !Exists('$(NuGetPackageRoot)studev.aotanywhere/1.1.0/build/Crosscompile.targets')"
            Text="These Windows archives require StuDev.AotAnywhere 1.1.0 and Vezel.Zig.Toolsets for your build host. See README.md." />
@@ -45,7 +50,7 @@
     <PropertyGroup>
       <_LightDlPatchedQuic>$(IntermediateOutputPath)lightdl-static-quic/System.Net.Quic.dll</_LightDlPatchedQuic>
     </PropertyGroup>
-    <Exec Command="dotnet &quot;$(LightDlQuicPatcherPath)&quot; &quot;@(_LightDlQuicInput)&quot; &quot;$(_LightDlPatchedQuic)&quot;" />
+    <Exec EnvironmentVariables="DOTNET_ROLL_FORWARD_TO_PRERELEASE=1" Command="dotnet &quot;$(LightDlQuicPatcherPath)&quot; &quot;@(_LightDlQuicInput)&quot; &quot;$(_LightDlPatchedQuic)&quot;" />
     <ItemGroup>
       <IlcReference Remove="@(_LightDlQuicInput)" />
       <IlcReference Include="$(_LightDlPatchedQuic)" />

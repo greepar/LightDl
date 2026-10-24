@@ -7,3 +7,7 @@ artifacts/
 .idea/
 .DS_Store
 *.DotSettings.user
+
+.native-build/
+native-net11/
+Quic.NuGet.Config

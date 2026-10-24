@@ -18,7 +18,49 @@ env:
   QUIC_PACKAGE_VERSION: 0.4.5-quic-ci.${{ github.run_number }}.${{ github.run_attempt }}
 
 jobs:
+  native-crypto:
+    name: Build .NET 11 crypto / ${{ matrix.platform.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: ubuntu-24.04, rid: linux-x64, musl: false }
+          - { os: ubuntu-24.04-arm, rid: linux-arm64, musl: false }
+          - { os: ubuntu-24.04, rid: linux-musl-x64, musl: true }
+          - { os: ubuntu-24.04-arm, rid: linux-musl-arm64, musl: true }
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: dotnet/runtime
+          ref: 820230c386db5b0106c5430b3e5aee92a7826bf5
+          path: .native-build/runtime
+          sparse-checkout: |
+            src/native/libs/System.Security.Cryptography.Native
+            src/native/libs/Common
+            src/native/minipal
+      - name: Build glibc shim
+        if: ${{ !matrix.platform.musl }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang cmake ninja-build libssl-dev
+          sh eng/build-net11-crypto.sh .native-build/runtime native-net11/${{ matrix.platform.rid }}
+      - name: Build musl shim
+        if: matrix.platform.musl
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            mcr.microsoft.com/dotnet/sdk:11.0.100-rc.2-alpine3.24-aot \
+            sh -c 'apk add --no-cache cmake ninja openssl-dev && \
+              sh eng/build-net11-crypto.sh .native-build/runtime native-net11/${{ matrix.platform.rid }} && \
+              chmod -R a+rwX native-net11'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crypto-${{ matrix.platform.rid }}
+          path: native-net11/*/libSystem.Security.Cryptography.Native.OpenSsl.a
+          if-no-files-found: error
+
   package:
+    needs: native-crypto
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +69,11 @@ jobs:
           dotnet-version: |
             10.0.402
             11.0.100-rc.2.26504.105
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: crypto-*
+          merge-multiple: true
+          path: src/LightDl/buildTransitive/native/net11
       - name: Test net10.0 and net11.0
         shell: bash
         run: |
@@ -78,15 +125,11 @@ jobs:
       - name: Publish from NuGet package
         shell: bash
         run: |
-          package_source="$PWD/artifacts"
-          if [[ '${{ runner.os }}' == 'Windows' ]]; then
-            export MSYS2_ARG_CONV_EXCL='*'
-            package_source="$(cygpath -m "$PWD")/artifacts"
-          fi
+          python3 eng/write-quic-nuget-config.py
           dotnet publish tests/LightDl.QuicSmoke/LightDl.QuicSmoke.csproj -c Release \
             -r '${{ matrix.platform.rid }}' -p:LightDlSmokeTargetFramework='${{ matrix.tfm }}' \
             -p:LightDlTestPackageVersion="$QUIC_PACKAGE_VERSION" \
-            --source "$package_source" --source https://api.nuget.org/v3/index.json -o publish
+            --configfile "$PWD/Quic.NuGet.Config" -o publish
       - name: Run local HTTP/3 and certificate validation test
         shell: bash
         run: |
