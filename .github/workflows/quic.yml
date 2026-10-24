@@ -34,7 +34,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: dotnet/runtime
-          ref: 820230c386db5b0106c5430b3e5aee92a7826bf5
+          ref: 474ed963699fc29809015392738a15231aaae2de
           path: .native-build/runtime
           sparse-checkout: |
             src/native/libs/System.Security.Cryptography.Native
