@@ -19,6 +19,10 @@
     <NativeLibrary Include="$(_LightDlQuicRoot)native/$(RuntimeIdentifier)/secur32-extra.a" />
     <LinkerArg Include="ws2_32.lib;ntdll.lib;bcrypt.lib;ncrypt.lib;crypt32.lib;iphlpapi.lib;advapi32.lib;secur32.lib;winmm.lib;ole32.lib;oleaut32.lib" />
   </ItemGroup>
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64'">
+    <!-- Clang's Windows C stack probe follows the same ABI as MSVC's __chkstk. -->
+    <LinkerArg Include="/alternatename:___chkstk_ms=__chkstk" />
+  </ItemGroup>
   <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('osx'))">
     <LinkerArg Include="-framework Security;-framework CoreFoundation" />
   </ItemGroup>
@@ -32,18 +36,9 @@
     <Error Condition="'$(TargetFramework)' == 'net11.0' and $(RuntimeIdentifier.StartsWith('linux')) and !Exists('$(_LightDlQuicRoot)native/net11/$(RuntimeIdentifier)/libSystem.Security.Cryptography.Native.OpenSsl.a')"
            Text="The .NET 11 static crypto shim is missing for $(RuntimeIdentifier). Run eng/build-net11-crypto.sh or use the complete NuGet package built by CI." />
     <Error Condition="'$(Http3Support)' == 'false'" Text="LightDlStaticQuic requires Http3Support=true." />
-    <Error Condition="$(RuntimeIdentifier.StartsWith('win')) and !Exists('$(NuGetPackageRoot)studev.aotanywhere/1.1.0/build/Crosscompile.targets')"
-           Text="These Windows archives require StuDev.AotAnywhere 1.1.0 and Vezel.Zig.Toolsets for your build host. See README.md." />
+    <Error Condition="$(RuntimeIdentifier.StartsWith('win')) and !$([MSBuild]::IsOSPlatform('Windows'))"
+           Text="Static Windows MsQuic requires a Windows build host with Native AOT MSVC tools. The preview's MinGW cross-link produces binaries that fail startup and is not supported." />
   </Target>
-  <!-- Windows archives use the preview's MinGW/Zig ABI, not the MSVC ABI. -->
-  <Import Project="$(NuGetPackageRoot)studev.aotanywhere/1.1.0/build/Crosscompile.targets"
-          Condition="$(RuntimeIdentifier.StartsWith('win')) and $([MSBuild]::IsOSPlatform('Windows')) and Exists('$(NuGetPackageRoot)studev.aotanywhere/1.1.0/build/Crosscompile.targets')" />
-  <PropertyGroup Condition="$(RuntimeIdentifier.StartsWith('win'))">
-    <_AotAnywhereWindowsCross>true</_AotAnywhereWindowsCross>
-    <!-- Crosscompile.targets computes this while importing, before our override. -->
-    <_AotAnywhereWinDirectLinkActive Condition="'$(NativeLib)' != 'Static'">true</_AotAnywhereWinDirectLinkActive>
-    <IlcUseEnvironmentalTools>true</IlcUseEnvironmentalTools>
-  </PropertyGroup>
   <Target Name="LightDlPatchQuicRuntime" AfterTargets="ComputeIlcCompileInputs">
     <ItemGroup>
       <_LightDlQuicInput Include="@(IlcReference)" Condition="'%(Filename)' == 'System.Net.Quic'" />
@@ -58,12 +53,7 @@
       <IlcReference Include="$(_LightDlPatchedQuic)" />
     </ItemGroup>
   </Target>
-  <Target Name="LightDlFixStaticQuicLinker" AfterTargets="SetupOSSpecificProps" BeforeTargets="AotAnywhereDirectLinkNative;AotAnywhereDirectLinkWindows">
-    <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('win')) and '$(TargetFramework)' == 'net11.0'">
-      <!-- .NET 11's SDK name is not supplied by Zig's MinGW libraries. -->
-      <LinkerArg Remove="&quot;Synchronization.lib&quot;;Synchronization.lib;synchronization.lib" />
-      <LinkerArg Include="api-ms-win-core-synch-l1-2-0.lib" />
-    </ItemGroup>
+  <Target Name="LightDlFixStaticQuicLinker" AfterTargets="SetupOSSpecificProps" BeforeTargets="AotAnywhereDirectLinkNative">
     <!-- The Linux archive already contains OpenSSL and the .NET crypto shim. -->
     <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('linux'))">
       <NativeLibrary Remove="$(IlcFrameworkNativePath)libSystem.Security.Cryptography.Native.OpenSsl.a" />

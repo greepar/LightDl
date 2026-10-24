@@ -20,8 +20,15 @@ Windows x64/ARM64 runners. `eng/msquic-sspi.c` instead calls the corresponding
 entry in the OS-provided `InitSecurityInterfaceW` function table, preserving the
 extended API and its buffer-length parameter. Rebuild with
 `sh eng/build-windows-sspi.sh /path/to/zig src/LightDl/buildTransitive/native`
-using Zig toolset 0.17.0.1. The .NET 11 `Synchronization.lib` SDK reference is mapped
-to Zig's `api-ms-win-core-synch-l1-2-0` import library.
+using Zig toolset 0.17.0.1. Windows now uses the normal Native AOT MSVC linker, including .NET 11's SDK
+`Synchronization.lib`. The only x64 ABI alias needed by the supplied C archive is
+`___chkstk_ms=__chkstk`. Zig remains a way to reproduce the small SSPI archive;
+it is not a dependency for Windows application builds.
+
+Runtime testing found that the preview's mixed MinGW/MSVC startup crashes before
+entering managed code even after all DLL imports resolve. Windows static publishing
+therefore requires a Windows host with the Native AOT C++ build tools; Unix-to-Windows
+static cross-publishing is explicitly rejected instead of producing a broken EXE.
 
 `eng/PatchQuic` restores the preview patcher's narrow rewrite as reviewable source.
 It checks the implementation assembly's runtime version and loader call sites,

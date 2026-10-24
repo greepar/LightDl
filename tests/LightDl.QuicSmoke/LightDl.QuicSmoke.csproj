@@ -13,8 +13,4 @@
     <!-- Exercise the actual package and its transitive targets, not a project reference. -->
     <PackageReference Include="LightDl" Version="$(LightDlTestPackageVersion)" />
   </ItemGroup>
-  <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('win'))">
-    <PackageReference Include="StuDev.AotAnywhere" Version="1.1.0" />
-    <PackageReference Include="Vezel.Zig.Toolsets.$(NETCoreSdkPortableRuntimeIdentifier)" Version="0.17.0.1" PrivateAssets="all" />
-  </ItemGroup>
 </Project>

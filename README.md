@@ -175,16 +175,9 @@ Static integration currently accepts **net10.0 with runtime 10.0.12 / 10.0.13**,
 
 Archives are provided for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `linux-musl-x64`, `linux-musl-arm64`, `osx-x64`, and `osx-arm64`. `win-x86` is unsupported. macOS archives require macOS 14 or later. The NuGet package carries static archives, but only the selected archive enters a static AOT executable; normal publish output does not contain them.
 
-The supplied Windows archives require the preview's Zig/AotAnywhere toolchain. Add explicit application references when enabling Windows static mode (replace the Zig package suffix with your **build host** RID):
+Windows static mode uses the normal Native AOT **MSVC toolchain on a Windows build host**. No Zig/AotAnywhere package is required. Cross-publishing Windows static binaries from Unix is rejected: the preview's mixed MinGW/MSVC startup was found to crash before managed code. Use the Windows GitHub Actions jobs to build Windows executables.
 
-```xml
-<ItemGroup>
-  <PackageReference Include="StuDev.AotAnywhere" Version="1.1.0" />
-  <PackageReference Include="Vezel.Zig.Toolsets.osx-arm64" Version="0.17.0.1" PrivateAssets="all" />
-</ItemGroup>
-```
-
-Cross-compilation also requires the appropriate toolchain. These dependencies are deliberately not imposed on ordinary LightDl consumers. The package includes a matching .NET 11 static crypto shim for each Linux RID, built from the pinned .NET 11 RC2 source. Static MsQuic does not mean a fully static operating-system executable: macOS frameworks, Windows system DLLs, and glibc on Linux remain external. A fully static musl executable additionally requires `StaticExecutable=true`, compatible native build tools, and usually `InvariantGlobalization=true`.
+The package includes a matching .NET 11 static crypto shim for each Linux RID, built from the pinned .NET 11 RC2 source. Static MsQuic does not mean a fully static operating-system executable: macOS frameworks, Windows system DLLs, and glibc on Linux remain external. A fully static musl executable additionally requires `StaticExecutable=true`, compatible native build tools, and usually `InvariantGlobalization=true`.
 
 To actually require HTTP/3, configure the downloader:
 
