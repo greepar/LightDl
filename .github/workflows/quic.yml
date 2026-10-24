@@ -50,7 +50,7 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/src" -w /src \
             mcr.microsoft.com/dotnet/sdk:11.0.100-rc.2-alpine3.24-aot \
-            sh -c 'apk add --no-cache cmake ninja openssl-dev && \
+            sh -c 'apk add --no-cache clang build-base zlib-dev cmake ninja openssl-dev && \
               sh eng/build-net11-crypto.sh .native-build/runtime native-net11/${{ matrix.platform.rid }} && \
               chmod -R a+rwX native-net11'
       - uses: actions/upload-artifact@v4
@@ -173,7 +173,8 @@ jobs:
             -e QUIC_PACKAGE_VERSION="$QUIC_PACKAGE_VERSION" \
             -e TARGET_FRAMEWORK='${{ matrix.tfm }}' -e TARGET_RID='${{ matrix.platform.rid }}' \
             mcr.microsoft.com/dotnet/sdk:11.0.100-rc.2-alpine3.24-aot \
-            sh -c 'dotnet publish tests/LightDl.QuicSmoke/LightDl.QuicSmoke.csproj -c Release \
+            sh -c 'apk add --no-cache clang build-base zlib-dev && \
+              dotnet publish tests/LightDl.QuicSmoke/LightDl.QuicSmoke.csproj -c Release \
               -r "$TARGET_RID" -p:LightDlSmokeTargetFramework="$TARGET_FRAMEWORK" \
               -p:LightDlTestPackageVersion="$QUIC_PACKAGE_VERSION" \
               -p:StaticExecutable=true -p:InvariantGlobalization=true \
