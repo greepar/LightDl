@@ -13,7 +13,7 @@ dotnet add package LightDl
 Or add it to your `.csproj`:
 
 ```xml
-<PackageReference Include="LightDl" Version="0.4.5" />
+<PackageReference Include="LightDl" Version="0.4.6" />
 ```
 
 The package includes `net10.0` and `net11.0` assemblies. The `net11.0` assembly enables Runtime Async (Async2) and is built with the .NET 11 RC2 SDK. Applications targeting `net11.0` select it automatically when rebuilt; installing a newer runtime alone does not replace the assembly already bundled with an application.

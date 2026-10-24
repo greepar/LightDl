@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  QUIC_PACKAGE_VERSION: 0.4.5-quic-ci.${{ github.run_number }}.${{ github.run_attempt }}
+  QUIC_PACKAGE_VERSION: 0.4.6-quic-ci.${{ github.run_number }}.${{ github.run_attempt }}
 
 jobs:
   native-crypto:
