@@ -46,6 +46,12 @@ jobs:
       - name: Pack
         run: dotnet pack src/LightDl/LightDl.csproj --configuration Release --no-build --output artifacts /p:PackageVersion=${{ steps.version.outputs.version }}
 
+      - name: Verify MsQuic package options
+        shell: pwsh
+        run: |
+          $package = Get-ChildItem -Path artifacts -Filter *.nupkg | Select-Object -First 1
+          python eng/verify-quic-package.py $package.FullName
+
       - name: Upload NuGet artifact
         uses: actions/upload-artifact@v4
         with:

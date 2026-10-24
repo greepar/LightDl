@@ -40,6 +40,7 @@ static async Task<int> RunAsync(string[] args)
     var config = new LightDownloadConfig
     {
         EnableResume = options.EnableResume,
+        ForceHttp3 = options.ForceHttp3,
         IgnoreSslErrors = options.IgnoreSslErrors
     };
 
@@ -135,6 +136,7 @@ static CliOptions ParseArguments(string[] args)
     var enableResume = true;
     var ignoreSslErrors = false;
     var verbose = false;
+    var forceHttp3 = false;
     var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
     for (var i = 0; i < args.Length; i++)
@@ -149,6 +151,11 @@ static CliOptions ParseArguments(string[] args)
             case "-v":
             case "--version":
                 return new CliOptions { ShowVersion = true };
+
+            case "-h3":
+            case "--http3-only":
+                forceHttp3 = true;
+                break;
 
             case "--verbose":
                 verbose = true;
@@ -225,6 +232,7 @@ static CliOptions ParseArguments(string[] args)
 
     return new CliOptions
     {
+        ForceHttp3 = forceHttp3,
         Verbose = verbose,
         Url = uri.AbsoluteUri,
         DestinationPath = destination,
@@ -309,6 +317,7 @@ static void PrintHelp()
               --directory           Treat the output path as a directory (default)
           -c, --chunks <count>      Number of download workers
               --conflict <policy>   rename, overwrite, fail, or skip (default: rename)
+          -h3, --http3-only         Require HTTP/3 (HTTPS and MsQuic required)
               --no-resume           Disable resume support
               --ignore-ssl-errors   Ignore TLS certificate validation errors
           -H, --header <header>     Add a request header, for example "Authorization: Bearer token"
@@ -329,6 +338,7 @@ file sealed class CliOptions
     public bool ShowHelp { get; init; }
     public bool ShowVersion { get; init; }
     public bool Verbose { get; init; }
+    public bool ForceHttp3 { get; init; }
     public string? Url { get; init; }
     public string? DestinationPath { get; init; }
     public LightDownloadDestinationKind DestinationKind { get; init; }

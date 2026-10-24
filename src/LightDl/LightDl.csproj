@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFrameworks>net10.0;net11.0</TargetFrameworks>
@@ -23,6 +23,22 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <None Remove="buildTransitive/**/*;native-licenses/**/*" />
+    <None Include="buildTransitive/**/*" Pack="true" PackagePath="buildTransitive/%(RecursiveDir)%(Filename)%(Extension)" />
+    <None Include="native-licenses/**/*" Pack="true" PackagePath="licenses/%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <Target Name="BuildQuicPatcher" BeforeTargets="_GetPackageFiles">
+    <MSBuild Projects="../../eng/PatchQuic/PatchQuic.csproj" Targets="Restore;Build"
+             Properties="Configuration=Release" RemoveProperties="TargetFramework;TargetFrameworks;RuntimeIdentifier;PublishAot;SelfContained" />
+    <ItemGroup>
+      <None Include="../../eng/PatchQuic/bin/Release/net10.0/*.dll;../../eng/PatchQuic/bin/Release/net10.0/*.json"
+            Pack="true" PackagePath="tools/" />
+    </ItemGroup>
+  </Target>
+
+  <ItemGroup>
+    <None Include="../../eng/STATIC-QUIC.md" Pack="true" PackagePath="eng/" />
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 

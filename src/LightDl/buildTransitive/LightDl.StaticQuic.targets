@@ -1,0 +1,61 @@
+<Project>
+  <PropertyGroup>
+    <_LightDlQuicRoot>$(MSBuildThisFileDirectory)</_LightDlQuicRoot>
+    <LightDlQuicPatcherPath Condition="'$(LightDlQuicPatcherPath)' == ''">$(_LightDlQuicRoot)../tools/PatchQuic.dll</LightDlQuicPatcherPath>
+    <AppleMinOSVersion Condition="$(RuntimeIdentifier.StartsWith('osx')) and '$(AppleMinOSVersion)' == ''">14.0</AppleMinOSVersion>
+    <Http3Support Condition="'$(Http3Support)' == ''">true</Http3Support>
+  </PropertyGroup>
+  <ItemGroup>
+    <DirectPInvoke Include="__Internal" />
+    <NativeLibrary Include="$(_LightDlQuicRoot)native/$(RuntimeIdentifier)/libmsquic.a" />
+  </ItemGroup>
+  <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('linux'))">
+    <DirectPInvoke Include="System.Security.Cryptography.Native.OpenSsl" />
+  </ItemGroup>
+  <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('win'))">
+    <NativeLibrary Include="$(_LightDlQuicRoot)native/$(RuntimeIdentifier)/secur32-extra.a" />
+    <LinkerArg Include="ws2_32.lib;ntdll.lib;bcrypt.lib;ncrypt.lib;crypt32.lib;iphlpapi.lib;advapi32.lib;secur32.lib;winmm.lib;ole32.lib;oleaut32.lib" />
+  </ItemGroup>
+  <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('osx'))">
+    <LinkerArg Include="-framework Security;-framework CoreFoundation" />
+  </ItemGroup>
+  <Target Name="LightDlValidateStaticQuic" BeforeTargets="PrepareForBuild;PrepareForPublish">
+    <Error Condition="'$(PublishAot)' != 'true'" Text="LightDlStaticQuic requires PublishAot=true." />
+    <Error Condition="'$(TargetFramework)' != 'net10.0' and '$(TargetFramework)' != 'net11.0'" Text="LightDlStaticQuic supports net10.0 and net11.0 with the runtime versions validated by the patcher." />
+    <Error Condition="!Exists('$(_LightDlQuicRoot)native/$(RuntimeIdentifier)/libmsquic.a')"
+           Text="Unsupported static MsQuic RID: $(RuntimeIdentifier). Specify a supported RID (x64/arm64 Windows, Linux, Linux musl, or macOS)." />
+    <Error Condition="$(RuntimeIdentifier.StartsWith('osx')) and '$(AppleMinOSVersion)' != '' and $([MSBuild]::VersionLessThan('$(AppleMinOSVersion)', '14.0'))"
+           Text="The supplied macOS MsQuic archives require AppleMinOSVersion 14.0 or later." />
+    <Error Condition="'$(Http3Support)' == 'false'" Text="LightDlStaticQuic requires Http3Support=true." />
+    <Error Condition="$(RuntimeIdentifier.StartsWith('win')) and !Exists('$(NuGetPackageRoot)studev.aotanywhere/1.1.0/build/Crosscompile.targets')"
+           Text="These Windows archives require StuDev.AotAnywhere 1.1.0 and Vezel.Zig.Toolsets for your build host. See README.md." />
+  </Target>
+  <!-- Windows archives use the preview's MinGW/Zig ABI, not the MSVC ABI. -->
+  <Import Project="$(NuGetPackageRoot)studev.aotanywhere/1.1.0/build/Crosscompile.targets"
+          Condition="$(RuntimeIdentifier.StartsWith('win')) and $([MSBuild]::IsOSPlatform('Windows')) and Exists('$(NuGetPackageRoot)studev.aotanywhere/1.1.0/build/Crosscompile.targets')" />
+  <PropertyGroup Condition="$(RuntimeIdentifier.StartsWith('win'))">
+    <_AotAnywhereWindowsCross>true</_AotAnywhereWindowsCross>
+    <IlcUseEnvironmentalTools>true</IlcUseEnvironmentalTools>
+  </PropertyGroup>
+  <Target Name="LightDlPatchQuicRuntime" AfterTargets="ComputeIlcCompileInputs">
+    <ItemGroup>
+      <_LightDlQuicInput Include="@(IlcReference)" Condition="'%(Filename)' == 'System.Net.Quic'" />
+    </ItemGroup>
+    <Error Condition="'@(_LightDlQuicInput->Count())' != '1'" Text="Expected exactly one System.Net.Quic assembly in Native AOT inputs." />
+    <PropertyGroup>
+      <_LightDlPatchedQuic>$(IntermediateOutputPath)lightdl-static-quic/System.Net.Quic.dll</_LightDlPatchedQuic>
+    </PropertyGroup>
+    <Exec Command="dotnet &quot;$(LightDlQuicPatcherPath)&quot; &quot;@(_LightDlQuicInput)&quot; &quot;$(_LightDlPatchedQuic)&quot;" />
+    <ItemGroup>
+      <IlcReference Remove="@(_LightDlQuicInput)" />
+      <IlcReference Include="$(_LightDlPatchedQuic)" />
+    </ItemGroup>
+  </Target>
+  <Target Name="LightDlFixStaticQuicLinker" AfterTargets="SetupOSSpecificProps" BeforeTargets="AotAnywhereDirectLinkNative">
+    <!-- The Linux archive already contains OpenSSL and the .NET crypto shim. -->
+    <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('linux'))">
+      <NativeLibrary Remove="$(IlcFrameworkNativePath)libSystem.Security.Cryptography.Native.OpenSsl.a" />
+      <LinkerArg Remove="$(IlcFrameworkNativePath)libSystem.Security.Cryptography.Native.OpenSsl.a;-Wl,--defsym,__xmknod=mknod" />
+    </ItemGroup>
+  </Target>
+</Project>

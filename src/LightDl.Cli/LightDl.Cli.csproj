@@ -14,4 +14,12 @@
     <ProjectReference Include="..\LightDl\LightDl.csproj" />
   </ItemGroup>
 
+  <PropertyGroup Condition="'$(LightDlStaticQuic)' == 'true'">
+    <LightDlQuicPatcherPath>$(MSBuildThisFileDirectory)../../eng/PatchQuic/bin/Release/net10.0/PatchQuic.dll</LightDlQuicPatcherPath>
+  </PropertyGroup>
+  <Target Name="BuildSourceQuicPatcher" BeforeTargets="LightDlPatchQuicRuntime" Condition="'$(LightDlStaticQuic)' == 'true'">
+    <MSBuild Projects="../../eng/PatchQuic/PatchQuic.csproj" Targets="Restore;Build"
+             Properties="Configuration=Release" RemoveProperties="TargetFramework;TargetFrameworks;RuntimeIdentifier;PublishAot;SelfContained;RuntimeFrameworkVersion" />
+  </Target>
+  <Import Project="../LightDl/buildTransitive/LightDl.targets" />
 </Project>

@@ -93,6 +93,9 @@ public class LightDownloadConfig
     /// </summary>
     public Func<HttpMessageHandler>? HttpMessageHandlerFactory { get; set; }
 
+    /// <summary>Requires HTTP/3 for every request and redirect. Requires HTTPS and a working MsQuic deployment.</summary>
+    public bool ForceHttp3 { get; set; }
+
     /// <summary>User-Agent header. Defaults to a Chrome-like UA.</summary>
     public string UserAgent { get; set; } =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36 Edg/149.0.0.0";
@@ -201,6 +204,7 @@ public class LightDownloadConfig
             Proxy = Proxy,
             UseProxy = UseProxy,
             HttpMessageHandlerFactory = HttpMessageHandlerFactory,
+            ForceHttp3 = ForceHttp3,
             UserAgent = UserAgent,
             BufferSize = BufferSize,
             MaxRetry = MaxRetry,

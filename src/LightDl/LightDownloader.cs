@@ -1537,7 +1537,15 @@ public sealed class LightDownloader : IDisposable
 
         for (var redirectCount = 0;; redirectCount++)
         {
+            if (_config.ForceHttp3 && currentUri.Scheme != Uri.UriSchemeHttps)
+                throw new HttpRequestException("HTTP/3 requires HTTPS, including redirect targets.");
+
             using var request = new HttpRequestMessage(HttpMethod.Get, currentUri);
+            if (_config.ForceHttp3)
+            {
+                request.Version = HttpVersion.Version30;
+                request.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
+            }
             request.Headers.Range = range;
             // Any content coding would break the mapping between response bytes and file offsets.
             request.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");

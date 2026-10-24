@@ -1,0 +1,137 @@
+name: MsQuic integration
+
+on:
+  push:
+    branches: [ 'feat/msquic-*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  QUIC_PACKAGE_VERSION: 0.4.5-quic-ci.${{ github.run_number }}.${{ github.run_attempt }}
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            10.0.402
+            11.0.100-rc.2.26504.105
+      - name: Test net10.0 and net11.0
+        shell: bash
+        run: |
+          for tfm in net10.0 net11.0; do
+            dotnet test tests/LightDl.Tests/LightDl.Tests.csproj -c Release \
+              -p:TargetFramework="$tfm" -p:TargetFrameworks="$tfm" \
+              --test-adapter-path "$HOME/.nuget/packages/xunit.runner.visualstudio/3.1.5/build/net8.0"
+          done
+      - name: Pack both frameworks
+        run: dotnet pack src/LightDl/LightDl.csproj -c Release -p:PackageVersion=${{ env.QUIC_PACKAGE_VERSION }} -o artifacts
+      - name: Verify default and shared deployments
+        run: python3 eng/verify-quic-package.py artifacts/LightDl.${{ env.QUIC_PACKAGE_VERSION }}.nupkg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quic-nuget
+          path: artifacts/*.nupkg
+          if-no-files-found: error
+
+  static:
+    name: Static ${{ matrix.platform.rid }} / ${{ matrix.tfm }}
+    needs: package
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        tfm: [ net10.0, net11.0 ]
+        platform:
+          - { os: windows-latest, rid: win-x64 }
+          - { os: windows-11-arm, rid: win-arm64 }
+          - { os: ubuntu-24.04, rid: linux-x64 }
+          - { os: ubuntu-24.04-arm, rid: linux-arm64 }
+          - { os: macos-15-intel, rid: osx-x64 }
+          - { os: macos-15, rid: osx-arm64 }
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            10.0.402
+            11.0.100-rc.2.26504.105
+      - uses: actions/download-artifact@v4
+        with:
+          name: quic-nuget
+          path: artifacts
+      - name: Install native build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+      - name: Publish from NuGet package
+        shell: bash
+        run: |
+          dotnet publish tests/LightDl.QuicSmoke/LightDl.QuicSmoke.csproj -c Release \
+            -r '${{ matrix.platform.rid }}' -p:TargetFramework='${{ matrix.tfm }}' \
+            -p:LightDlTestPackageVersion="$QUIC_PACKAGE_VERSION" \
+            --source "$PWD/artifacts" --source https://api.nuget.org/v3/index.json -o publish
+      - name: Run local HTTP/3 and certificate validation test
+        shell: bash
+        run: |
+          if [[ '${{ runner.os }}' == 'Windows' ]]; then
+            ./publish/LightDl.QuicSmoke.exe
+          else
+            ./publish/LightDl.QuicSmoke
+          fi
+      - name: Inspect native dependencies
+        shell: bash
+        run: python3 eng/inspect-quic-binary.py publish/LightDl.QuicSmoke
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quic-${{ matrix.platform.rid }}-${{ matrix.tfm }}
+          path: publish/*
+          if-no-files-found: ignore
+
+  musl:
+    name: Static ${{ matrix.platform.rid }} / ${{ matrix.tfm }}
+    needs: package
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        tfm: [ net10.0, net11.0 ]
+        platform:
+          - { os: ubuntu-24.04, rid: linux-musl-x64 }
+          - { os: ubuntu-24.04-arm, rid: linux-musl-arm64 }
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: quic-nuget
+          path: artifacts
+      - name: Publish and execute in Alpine
+        shell: bash
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            -e QUIC_PACKAGE_VERSION="$QUIC_PACKAGE_VERSION" \
+            -e TARGET_FRAMEWORK='${{ matrix.tfm }}' -e TARGET_RID='${{ matrix.platform.rid }}' \
+            mcr.microsoft.com/dotnet/sdk:11.0.100-rc.2.26504.105-alpine3.24-aot \
+            sh -c 'dotnet publish tests/LightDl.QuicSmoke/LightDl.QuicSmoke.csproj -c Release \
+              -r "$TARGET_RID" -p:TargetFramework="$TARGET_FRAMEWORK" \
+              -p:LightDlTestPackageVersion="$QUIC_PACKAGE_VERSION" \
+              -p:StaticExecutable=true -p:InvariantGlobalization=true \
+              --source /src/artifacts --source https://api.nuget.org/v3/index.json -o publish && \
+              ./publish/LightDl.QuicSmoke && chmod -R a+rwX publish'
+      - name: Inspect fully static ELF
+        run: python3 eng/inspect-quic-binary.py publish/LightDl.QuicSmoke --fully-static
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quic-${{ matrix.platform.rid }}-${{ matrix.tfm }}
+          path: publish/*
+          if-no-files-found: ignore

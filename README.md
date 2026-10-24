@@ -129,6 +129,73 @@ lightdl https://example.com/file.zip ./downloads \
 
 On Windows, use `lightdl.exe`. Run `lightdl --help` to see all options. The default conflict policy is `rename`, so an existing file is not overwritten.
 
+## MsQuic deployment and HTTP/3
+
+LightDl defaults to **not copying MsQuic shared libraries into build/publish output**. Existing system/runtime installations may still provide QUIC. HTTP/1.1 and HTTP/2 do not require MsQuic. Choose one deployment mode in the **application** project:
+
+| Mode | MSBuild properties | Result |
+| --- | --- | --- |
+| Default | None | No bundled `msquic.dll` / `libmsquic.*` |
+| Shared library | `LightDlIncludeMsQuic=true` | Retains the runtime pack's MsQuic library, or copies the file supplied below |
+| Static Native AOT | `PublishAot=true`, `LightDlStaticQuic=true` | Links the selected RID's archive; no separate MsQuic shared library |
+
+For Windows self-contained deployments, the .NET runtime pack provides `msquic.dll`:
+
+```xml
+<PropertyGroup>
+  <LightDlIncludeMsQuic>true</LightDlIncludeMsQuic>
+</PropertyGroup>
+```
+
+For framework-dependent applications or Unix platforms, also provide a compatible target-platform shared library:
+
+```xml
+<PropertyGroup>
+  <LightDlIncludeMsQuic>true</LightDlIncludeMsQuic>
+  <LightDlMsQuicLibrary>$(MSBuildProjectDirectory)/native/libmsquic.so.2</LightDlMsQuicLibrary>
+</PropertyGroup>
+```
+
+Use `msquic.dll` on Windows or `libmsquic.dylib` on macOS. The shared library's own dependencies must also be available. Publishing with `LightDlIncludeMsQuic=true` fails if no library is available. Build/publish into a clean output directory when changing modes; previously copied files are not deleted from arbitrary output directories.
+
+For static Native AOT on the build host's platform:
+
+```xml
+<PropertyGroup>
+  <PublishAot>true</PublishAot>
+  <LightDlStaticQuic>true</LightDlStaticQuic>
+</PropertyGroup>
+```
+
+```bash
+dotnet publish -c Release -r osx-arm64
+```
+
+Static integration currently accepts **net10.0 and runtime 10.0.12 / 10.0.13**. It validates and patches a project-local copy of `System.Net.Quic` before Native AOT compilation, preserving runtime checks and certificate validation. Unknown runtimes and .NET 11 are rejected; no runtime version is silently pinned or downgraded. Ordinary managed builds retain the original QUIC assembly.
+
+Archives are provided for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `linux-musl-x64`, `linux-musl-arm64`, `osx-x64`, and `osx-arm64`. `win-x86` is unsupported. macOS archives require macOS 14 or later. The NuGet package carries static archives, but only the selected archive enters a static AOT executable; normal publish output does not contain them.
+
+The supplied Windows archives require the preview's Zig/AotAnywhere toolchain. Add explicit application references when enabling Windows static mode (replace the Zig package suffix with your **build host** RID):
+
+```xml
+<ItemGroup>
+  <PackageReference Include="StuDev.AotAnywhere" Version="1.1.0" />
+  <PackageReference Include="Vezel.Zig.Toolsets.osx-arm64" Version="0.17.0.1" PrivateAssets="all" />
+</ItemGroup>
+```
+
+Cross-compilation also requires the appropriate toolchain. These dependencies are deliberately not imposed on ordinary LightDl consumers. Static MsQuic does not mean a fully static operating-system executable: macOS frameworks, Windows system DLLs, and glibc on Linux remain external. A fully static musl executable additionally requires `StaticExecutable=true`, compatible native build tools, and usually `InvariantGlobalization=true`.
+
+To actually require HTTP/3, configure the downloader:
+
+```csharp
+using var downloader = new LightDownloader(new LightDownloadConfig { ForceHttp3 = true });
+```
+
+The CLI supports `-h3` / `--http3-only`. This requires HTTPS on every request and redirect, and rejects fallback to HTTP/1.1 or HTTP/2. Deploying MsQuic alone does not change the downloader's default protocol selection.
+
+Native archive provenance, validation results, and local package instructions are in [eng/STATIC-QUIC.md](eng/STATIC-QUIC.md).
+
 ## Releases
 
 Pushing a version tag such as `v0.4.3` runs `.github/workflows/release.yml`. The workflow builds all Native AOT CLI archives, creates `LightDl.0.4.3.nupkg`, generates SHA-256 checksums, and attaches everything to the GitHub Release.

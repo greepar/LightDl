@@ -1,0 +1,51 @@
+<Project>
+  <!-- Defaults live in targets so options set in the consuming project win. -->
+  <PropertyGroup>
+    <LightDlIncludeMsQuic Condition="'$(LightDlIncludeMsQuic)' == ''">false</LightDlIncludeMsQuic>
+    <LightDlStaticQuic Condition="'$(LightDlStaticQuic)' == ''">false</LightDlStaticQuic>
+  </PropertyGroup>
+
+  <Import Project="LightDl.StaticQuic.targets" Condition="'$(LightDlStaticQuic)' == 'true'" />
+
+  <Target Name="LightDlValidateQuicOptions" BeforeTargets="LightDlValidateStaticQuic;PrepareForBuild;PrepareForPublish">
+    <Error Condition="'$(LightDlStaticQuic)' == 'true' and '$(LightDlIncludeMsQuic)' == 'true'"
+           Text="Choose either LightDlStaticQuic or LightDlIncludeMsQuic, not both." />
+    <Error Condition="'$(LightDlMsQuicLibrary)' != '' and '$(LightDlIncludeMsQuic)' != 'true'"
+           Text="LightDlMsQuicLibrary requires LightDlIncludeMsQuic=true." />
+    <Error Condition="'$(LightDlMsQuicLibrary)' != '' and !Exists('$(LightDlMsQuicLibrary)')"
+           Text="MsQuic shared library does not exist: $(LightDlMsQuicLibrary)" />
+  </Target>
+
+  <!-- Windows self-contained runtime packs contain msquic.dll. Leave that asset in
+       place only when explicitly requested. Do not remove unrelated native files. -->
+  <Target Name="LightDlFilterMsQuicBuild" AfterTargets="ResolveReferences" BeforeTargets="_CopyFilesMarkedCopyLocal"
+          Condition="'$(LightDlIncludeMsQuic)' != 'true'">
+    <ItemGroup>
+      <NativeCopyLocalItems Remove="@(NativeCopyLocalItems)" Condition="'%(Filename)' == 'msquic' or $([System.String]::Copy('%(Filename)').StartsWith('libmsquic'))" />
+      <RuntimeTargetsCopyLocalItems Remove="@(RuntimeTargetsCopyLocalItems)" Condition="'%(Filename)' == 'msquic' or $([System.String]::Copy('%(Filename)').StartsWith('libmsquic'))" />
+      <ReferenceCopyLocalPaths Remove="@(ReferenceCopyLocalPaths)" Condition="'%(Filename)' == 'msquic' or $([System.String]::Copy('%(Filename)').StartsWith('libmsquic'))" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="LightDlFilterMsQuicPublish" AfterTargets="ComputeFilesToPublish" BeforeTargets="GenerateSingleFileBundle"
+          Condition="'$(LightDlIncludeMsQuic)' != 'true'">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="'%(Filename)' == 'msquic' or $([System.String]::Copy('%(Filename)').StartsWith('libmsquic'))" />
+    </ItemGroup>
+  </Target>
+
+  <!-- Unix runtime packs do not ship MsQuic. Accept an explicitly supplied library;
+       also supports app-local Windows deployments. Never fetch binaries during build. -->
+  <ItemGroup Condition="'$(LightDlIncludeMsQuic)' == 'true' and '$(LightDlMsQuicLibrary)' != ''">
+    <Content Include="$(LightDlMsQuicLibrary)" Link="%(Filename)%(Extension)"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="LightDlRequireMsQuicAsset" AfterTargets="ComputeFilesToPublish"
+          Condition="'$(LightDlIncludeMsQuic)' == 'true' and '$(LightDlMsQuicLibrary)' == ''">
+    <ItemGroup>
+      <_LightDlDynamicQuic Include="@(ResolvedFileToPublish)" Condition="'%(Filename)' == 'msquic' or $([System.String]::Copy('%(Filename)').StartsWith('libmsquic'))" />
+    </ItemGroup>
+    <Error Condition="'@(_LightDlDynamicQuic)' == ''"
+           Text="No MsQuic shared library was supplied by the runtime pack. Set LightDlMsQuicLibrary to the shared library for the target RID, or use LightDlStaticQuic with Native AOT." />
+  </Target>
+</Project>
