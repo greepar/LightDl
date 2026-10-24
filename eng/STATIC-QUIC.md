@@ -2,7 +2,7 @@
 
 ## Native input provenance
 
-The archives and bridge functions were imported byte-for-byte from the user-supplied
+The MsQuic archives and their two address-returning bridge functions were imported byte-for-byte from the user-supplied
 `LightDl.0.4.4-h3-static.3.nupkg`.
 
 Input package SHA-256:
@@ -13,6 +13,15 @@ or original `eng/STATIC-QUIC.md`. The archives have not been rebuilt from source
 this change. Before a production release, recover the native build recipe and
 check the embedded MsQuic/OpenSSL versions against your update policy. The package
 preserves the supplied MsQuic, OpenSSL and .NET notices and includes Mono.Cecil's notice.
+
+The preview's tiny `secur32-extra.a` import libraries have been replaced. They
+required `Secur32.dll!QueryContextAttributesExW`, which does not resolve on the
+Windows x64/ARM64 runners. `eng/msquic-sspi.c` instead calls the corresponding
+entry in the OS-provided `InitSecurityInterfaceW` function table, preserving the
+extended API and its buffer-length parameter. Rebuild with
+`sh eng/build-windows-sspi.sh /path/to/zig src/LightDl/buildTransitive/native`
+using Zig toolset 0.17.0.1. The .NET 11 `Synchronization.lib` SDK reference is mapped
+to Zig's `api-ms-win-core-synch-l1-2-0` import library.
 
 `eng/PatchQuic` restores the preview patcher's narrow rewrite as reviewable source.
 It checks the implementation assembly's runtime version and loader call sites,
@@ -108,9 +117,9 @@ CI runs and downloadable packages/executables are available under
 - `osx-arm64/libmsquic.a`: `6e95cc2b93bbb4b87031e6e58ed2ce1030eab29a6016408c41b877564e67926e`
 - `osx-x64/libmsquic.a`: `949acee9753ac8ad034b2cc17f210c401267930b6c338f14bf3fb2964411ba58`
 - `win-arm64/libmsquic.a`: `a11c853a9c7df534fbb68a2b3a1f660ccfba48c0986a19ea39c2b51a01f02469`
-- `win-arm64/secur32-extra.a`: `8b3bed3593b141c8de667210efdf87a257f18568f9f2a20d81a6caa2edbfb74e`
+- `win-arm64/secur32-extra.a`: `0ed53720c4b3e3a5998b1294454fb9cc35102e4ecca6cfa6b3b4636448dcc2f7`
 - `win-x64/libmsquic.a`: `0134f8b56886c15a03ced1dd72792172401742ff852498601d8cdec88b9d454c`
-- `win-x64/secur32-extra.a`: `ab10e4e025ab93d8861d51875da802270860b37b25acb9c811b15bbe9e3ac27d`
+- `win-x64/secur32-extra.a`: `a88fe400e4c0a3e56709839833e8ad90aa7c51230ba8325a506dcdc204fee760`
 
 Additional .NET 11 Linux crypto shims:
 
