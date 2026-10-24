@@ -22,7 +22,12 @@ san.AddDnsName("localhost");
 san.AddIpAddress(IPAddress.Loopback);
 certificateRequest.CertificateExtensions.Add(san.Build());
 certificateRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
-using var certificate = certificateRequest.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(1));
+using var generatedCertificate = certificateRequest.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(1));
+// Schannel needs an import with a key provider/container rather than the
+// ephemeral CNG key attached by CertificateRequest.CreateSelfSigned.
+using var certificate = X509CertificateLoader.LoadPkcs12(
+    generatedCertificate.Export(X509ContentType.Pfx), null,
+    X509KeyStorageFlags.UserKeySet | X509KeyStorageFlags.Exportable);
 
 var builder = WebApplication.CreateSlimBuilder();
 builder.WebHost.UseQuic();
