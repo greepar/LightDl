@@ -29,8 +29,10 @@ entry in the OS-provided `InitSecurityInterfaceW` function table, preserving the
 extended API and its buffer-length parameter. Rebuild with
 `sh eng/build-windows-sspi.sh /path/to/zig src/LightDl/buildTransitive/native`
 using Zig toolset 0.17.0.1. Windows now uses the normal Native AOT MSVC linker, including .NET 11's SDK
-`Synchronization.lib`. The only x64 ABI alias needed by the supplied C archive is
-`___chkstk_ms=__chkstk`. Zig remains a way to reproduce the small SSPI archive;
+`Synchronization.lib`. The x64 stack-probe alias is `___chkstk_ms=__chkstk`. The MinGW archive also
+expects an out-of-line `RtlSecureZeroMemory`, whereas MSVC's headers inline it;
+the small compatibility archive supplies an implementation with volatile writes,
+selected through `/alternatename:RtlSecureZeroMemory=LightDlSecureZeroMemory`. Zig remains a way to reproduce the small SSPI archive;
 it is not a dependency for Windows application builds.
 
 Runtime testing found that the preview's mixed MinGW/MSVC startup crashes before
@@ -132,9 +134,9 @@ CI runs and downloadable packages/executables are available under
 - `osx-arm64/libmsquic.a`: `6e95cc2b93bbb4b87031e6e58ed2ce1030eab29a6016408c41b877564e67926e`
 - `osx-x64/libmsquic.a`: `949acee9753ac8ad034b2cc17f210c401267930b6c338f14bf3fb2964411ba58`
 - `win-arm64/libmsquic.a`: `485c7cc77c04aeaff1dd830e6f3a8ce12ed0e3ac0a0d9e40c46ae0147f704110`
-- `win-arm64/secur32-extra.a`: `0ed53720c4b3e3a5998b1294454fb9cc35102e4ecca6cfa6b3b4636448dcc2f7`
+- `win-arm64/secur32-extra.a`: `71467225282e17f4b93cfd2c2eb7c70e94ff91d903946654cb5199c2a8d1aeb1`
 - `win-x64/libmsquic.a`: `387eed76501e4189f1ab44b31ebd3c72495728807f90ee0bb793dcdec5660de3`
-- `win-x64/secur32-extra.a`: `a88fe400e4c0a3e56709839833e8ad90aa7c51230ba8325a506dcdc204fee760`
+- `win-x64/secur32-extra.a`: `0eb9705b6d3a209b8299f6bd04eae63e07bc8edd5d038279334ed960b5470073`
 
 Additional .NET 11 Linux crypto shims:
 
