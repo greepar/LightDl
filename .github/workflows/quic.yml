@@ -78,10 +78,15 @@ jobs:
       - name: Publish from NuGet package
         shell: bash
         run: |
+          package_source="$PWD/artifacts"
+          if [[ '${{ runner.os }}' == 'Windows' ]]; then
+            export MSYS2_ARG_CONV_EXCL='*'
+            package_source="$(cygpath -m "$PWD")/artifacts"
+          fi
           dotnet publish tests/LightDl.QuicSmoke/LightDl.QuicSmoke.csproj -c Release \
             -r '${{ matrix.platform.rid }}' -p:LightDlSmokeTargetFramework='${{ matrix.tfm }}' \
             -p:LightDlTestPackageVersion="$QUIC_PACKAGE_VERSION" \
-            --source "$PWD/artifacts" --source https://api.nuget.org/v3/index.json -o publish
+            --source "$package_source" --source https://api.nuget.org/v3/index.json -o publish
       - name: Run local HTTP/3 and certificate validation test
         shell: bash
         run: |

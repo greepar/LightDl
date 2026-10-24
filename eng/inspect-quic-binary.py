@@ -9,7 +9,7 @@ import sys
 
 binary = pathlib.Path(sys.argv[1]).resolve()
 if platform.system() == "Windows":
-    binary = binary.with_suffix(".exe")
+    binary = pathlib.Path(str(binary) + ".exe")
 assert binary.is_file(), binary
 assert not any("msquic" in p.name.lower() for p in binary.parent.iterdir()), "MsQuic sidecar present"
 if platform.system() == "Darwin":
