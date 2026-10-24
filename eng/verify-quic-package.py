@@ -19,6 +19,7 @@ with zipfile.ZipFile(package) as z:
     assert "buildTransitive/LightDl.targets" in names
     assert "tools/PatchQuic.dll" in names
     assert len([n for n in names if n.endswith("/libmsquic.a")]) == 8
+    assert len([n for n in names if n.startswith("buildTransitive/native/net11/") and n.endswith(".a")]) == 4
     assert not any(n.endswith("/msquic.dll") for n in names)
 
 with tempfile.TemporaryDirectory(prefix="lightdl-package-check-") as tmp:

@@ -36,7 +36,7 @@ preview version. Configure deployment properties in the application as shown in
 README.md. For a source CLI build, its project imports the same targets and builds
 the patcher from source automatically.
 
-## Validation on 2026-10-24
+## Initial local validation on 2026-10-24
 
 - SDK 10.0.402, runtime 10.0.13, macOS arm64.
 - 57 unit tests passed, including strict HTTP/3 requests and rejection of HTTP
@@ -58,9 +58,46 @@ the patcher from source automatically.
   PE import inspection found Windows system DLLs and no `msquic.dll` dependency.
   Windows execution was not performed.
 - Runtime 10.0.12 support is inherited from the supplied preview; this run checks
-  runtime 10.0.13. .NET 11 and unknown runtime versions are rejected in static mode.
+  runtime 10.0.13. The initial package did not yet enable .NET 11.
 - Linux and Windows arm64 execution have not been validated in this workspace.
   Cross-link success is not proof of execution or successful HTTP/3 traffic.
+
+## .NET 11 RC2 and GitHub Actions
+
+Static mode also accepts the exact runtime `11.0.0-rc.2.26504.105`. The public
+QUIC loader was inspected at tag `v11.0.0-rc.2.26504.105` and the actual runtime
+assembly passed the patcher's version and IL checks. Other .NET 11 builds remain
+rejected until reviewed. Runtime Async in LightDl's net11.0 assembly is retained.
+
+Linux's .NET 11 crypto interop uses new native entry points. The .NET 10 shim
+inside the original combined archive cannot provide those. The package therefore
+links a separate, matching .NET 11 static crypto archive **before** the combined
+MsQuic/OpenSSL archive. The linker resolves the new shim first and does not extract
+the old embedded shim. These additional archives are built from public
+`dotnet/runtime` commit `474ed963699fc29809015392738a15231aaae2de` (the RC2
+release tag), using the official standalone `LOCAL_BUILD` CMake configuration with
+`FEATURE_DISTRO_AGNOSTIC_SSL=OFF` and `HAVE_OPENSSL_ENGINE=OFF` to match the
+combined archive's no-engine OpenSSL build. This binds OpenSSL directly instead of loading a
+shared OpenSSL library. `eng/build-net11-crypto.sh` contains the build command;
+`.github/workflows/quic.yml` contains the glibc and Alpine build environments.
+
+The workflow builds all four Linux shims from source, packs both target frameworks,
+runs unit tests for both, and validates the resulting NuGet package with an external
+consumer. Its 16 static AOT jobs cover both frameworks on all eight RIDs. Each job:
+
+- Starts an HTTP/3-only Kestrel origin inside the published Native AOT executable.
+- Confirms that default certificate validation rejects its untrusted certificate.
+- Explicitly permits that test certificate, downloads a 1 MB payload with multiple
+  HTTP/3 range requests, and validates SHA-256.
+- Rejects MsQuic sidecars and inspects the executable's native dependencies.
+- For musl, also requires no ELF interpreter or dynamic dependencies.
+
+The patcher can run on a host with only the .NET 11 SDK/runtime, including the
+RC2 Alpine image. Roll-forward applies only to this build tool; the target runtime
+assembly still has to match the explicit allowlist.
+
+CI runs and downloadable packages/executables are available under
+[MsQuic integration](https://github.com/greepar/LightDl/actions/workflows/quic.yml).
 
 ## Archive SHA-256 values
 
@@ -74,3 +111,10 @@ the patcher from source automatically.
 - `win-arm64/secur32-extra.a`: `8b3bed3593b141c8de667210efdf87a257f18568f9f2a20d81a6caa2edbfb74e`
 - `win-x64/libmsquic.a`: `0134f8b56886c15a03ced1dd72792172401742ff852498601d8cdec88b9d454c`
 - `win-x64/secur32-extra.a`: `ab10e4e025ab93d8861d51875da802270860b37b25acb9c811b15bbe9e3ac27d`
+
+Additional .NET 11 Linux crypto shims:
+
+- `net11/linux-arm64/libSystem.Security.Cryptography.Native.OpenSsl.a`: `31044e2f719599d4b620b13616eec24152ec0857e6b623a951525d8e84771d57`
+- `net11/linux-musl-arm64/libSystem.Security.Cryptography.Native.OpenSsl.a`: `41b06ee30d96b3282242a46977bf8c825fa1fd7b725d4a8a88b896619a990a9b`
+- `net11/linux-musl-x64/libSystem.Security.Cryptography.Native.OpenSsl.a`: `632cebc99c530028f22c3099c37170c8aec47182fd652cb4ab25a28e853cb1cd`
+- `net11/linux-x64/libSystem.Security.Cryptography.Native.OpenSsl.a`: `24fd7336d2accd9bb1a0be1b1237c6688151bc49dd70939d2ccc75dab200c965`

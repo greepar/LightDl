@@ -40,6 +40,8 @@
           Condition="$(RuntimeIdentifier.StartsWith('win')) and $([MSBuild]::IsOSPlatform('Windows')) and Exists('$(NuGetPackageRoot)studev.aotanywhere/1.1.0/build/Crosscompile.targets')" />
   <PropertyGroup Condition="$(RuntimeIdentifier.StartsWith('win'))">
     <_AotAnywhereWindowsCross>true</_AotAnywhereWindowsCross>
+    <!-- Crosscompile.targets computes this while importing, before our override. -->
+    <_AotAnywhereWinDirectLinkActive Condition="'$(NativeLib)' != 'Static'">true</_AotAnywhereWinDirectLinkActive>
     <IlcUseEnvironmentalTools>true</IlcUseEnvironmentalTools>
   </PropertyGroup>
   <Target Name="LightDlPatchQuicRuntime" AfterTargets="ComputeIlcCompileInputs">

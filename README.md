@@ -16,7 +16,7 @@ Or add it to your `.csproj`:
 <PackageReference Include="LightDl" Version="0.4.5" />
 ```
 
-The package includes `net10.0` and `net11.0` assemblies. The `net11.0` assembly enables Runtime Async (Async2) and is built with the .NET 11 RC1 SDK. Applications targeting `net11.0` select it automatically when rebuilt; installing a newer runtime alone does not replace the assembly already bundled with an application.
+The package includes `net10.0` and `net11.0` assemblies. The `net11.0` assembly enables Runtime Async (Async2) and is built with the .NET 11 RC2 SDK. Applications targeting `net11.0` select it automatically when rebuilt; installing a newer runtime alone does not replace the assembly already bundled with an application.
 
 ## Usage
 
@@ -171,7 +171,7 @@ For static Native AOT on the build host's platform:
 dotnet publish -c Release -r osx-arm64
 ```
 
-Static integration currently accepts **net10.0 and runtime 10.0.12 / 10.0.13**. It validates and patches a project-local copy of `System.Net.Quic` before Native AOT compilation, preserving runtime checks and certificate validation. Unknown runtimes and .NET 11 are rejected; no runtime version is silently pinned or downgraded. Ordinary managed builds retain the original QUIC assembly.
+Static integration currently accepts **net10.0 with runtime 10.0.12 / 10.0.13**, and **net11.0 with runtime 11.0.0-rc.2.26504.105**. It validates and patches a project-local copy of `System.Net.Quic` before Native AOT compilation, preserving runtime checks and certificate validation. Unknown runtime builds are rejected; no runtime version is silently pinned or downgraded. Ordinary managed builds retain the original QUIC assembly.
 
 Archives are provided for `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `linux-musl-x64`, `linux-musl-arm64`, `osx-x64`, and `osx-arm64`. `win-x86` is unsupported. macOS archives require macOS 14 or later. The NuGet package carries static archives, but only the selected archive enters a static AOT executable; normal publish output does not contain them.
 
@@ -184,7 +184,7 @@ The supplied Windows archives require the preview's Zig/AotAnywhere toolchain. A
 </ItemGroup>
 ```
 
-Cross-compilation also requires the appropriate toolchain. These dependencies are deliberately not imposed on ordinary LightDl consumers. Static MsQuic does not mean a fully static operating-system executable: macOS frameworks, Windows system DLLs, and glibc on Linux remain external. A fully static musl executable additionally requires `StaticExecutable=true`, compatible native build tools, and usually `InvariantGlobalization=true`.
+Cross-compilation also requires the appropriate toolchain. These dependencies are deliberately not imposed on ordinary LightDl consumers. The package includes a matching .NET 11 static crypto shim for each Linux RID, built from the pinned .NET 11 RC2 source. Static MsQuic does not mean a fully static operating-system executable: macOS frameworks, Windows system DLLs, and glibc on Linux remain external. A fully static musl executable additionally requires `StaticExecutable=true`, compatible native build tools, and usually `InvariantGlobalization=true`.
 
 To actually require HTTP/3, configure the downloader:
 
