@@ -7,6 +7,10 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+concurrency:
+  group: msquic-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -75,7 +79,7 @@ jobs:
         shell: bash
         run: |
           dotnet publish tests/LightDl.QuicSmoke/LightDl.QuicSmoke.csproj -c Release \
-            -r '${{ matrix.platform.rid }}' -p:TargetFramework='${{ matrix.tfm }}' \
+            -r '${{ matrix.platform.rid }}' -p:LightDlSmokeTargetFramework='${{ matrix.tfm }}' \
             -p:LightDlTestPackageVersion="$QUIC_PACKAGE_VERSION" \
             --source "$PWD/artifacts" --source https://api.nuget.org/v3/index.json -o publish
       - name: Run local HTTP/3 and certificate validation test
@@ -120,9 +124,9 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src \
             -e QUIC_PACKAGE_VERSION="$QUIC_PACKAGE_VERSION" \
             -e TARGET_FRAMEWORK='${{ matrix.tfm }}' -e TARGET_RID='${{ matrix.platform.rid }}' \
-            mcr.microsoft.com/dotnet/sdk:11.0.100-rc.2.26504.105-alpine3.24-aot \
+            mcr.microsoft.com/dotnet/sdk:11.0.100-rc.2-alpine3.24-aot \
             sh -c 'dotnet publish tests/LightDl.QuicSmoke/LightDl.QuicSmoke.csproj -c Release \
-              -r "$TARGET_RID" -p:TargetFramework="$TARGET_FRAMEWORK" \
+              -r "$TARGET_RID" -p:LightDlSmokeTargetFramework="$TARGET_FRAMEWORK" \
               -p:LightDlTestPackageVersion="$QUIC_PACKAGE_VERSION" \
               -p:StaticExecutable=true -p:InvariantGlobalization=true \
               --source /src/artifacts --source https://api.nuget.org/v3/index.json -o publish && \

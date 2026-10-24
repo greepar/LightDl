@@ -25,6 +25,7 @@ certificateRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(f
 using var certificate = certificateRequest.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(1));
 
 var builder = WebApplication.CreateSlimBuilder();
+builder.WebHost.UseQuic();
 builder.WebHost.ConfigureKestrel(options => options.Listen(IPAddress.Loopback, 0, listen =>
 {
     listen.Protocols = HttpProtocols.Http3;
