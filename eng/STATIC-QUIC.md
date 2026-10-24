@@ -2,7 +2,7 @@
 
 ## Native input provenance
 
-The MsQuic archives and their two address-returning bridge functions were imported byte-for-byte from the user-supplied
+The MsQuic archives and their two address-returning bridge functions originate from the user-supplied
 `LightDl.0.4.4-h3-static.3.nupkg`.
 
 Input package SHA-256:
@@ -13,6 +13,14 @@ or original `eng/STATIC-QUIC.md`. The archives have not been rebuilt from source
 this change. Before a production release, recover the native build recipe and
 check the embedded MsQuic/OpenSSL versions against your update policy. The package
 preserves the supplied MsQuic, OpenSSL and .NET notices and includes Mono.Cecil's notice.
+
+The Windows COFF objects use the GNU linker convention for unwind COMDATs.
+MSVC rejects those standalone `.xdata$function` / `.pdata$function` sections.
+`eng/normalize-windows-coff.py` changes only their section-definition auxiliary
+records to associate them with the matching `.text$function` section. Code,
+relocations, unwind payloads, symbol indexes, and archive sizes are preserved.
+Apply the script to the two Windows MsQuic archives and SSPI archives after import
+or rebuild. Linux and macOS combined archives remain byte-for-byte unchanged.
 
 The preview's tiny `secur32-extra.a` import libraries have been replaced. They
 required `Secur32.dll!QueryContextAttributesExW`, which does not resolve on the
@@ -123,9 +131,9 @@ CI runs and downloadable packages/executables are available under
 - `linux-x64/libmsquic.a`: `e5258d3efaf9ce100985778e822b8379b5db72094d3ff10cad8292002569afa5`
 - `osx-arm64/libmsquic.a`: `6e95cc2b93bbb4b87031e6e58ed2ce1030eab29a6016408c41b877564e67926e`
 - `osx-x64/libmsquic.a`: `949acee9753ac8ad034b2cc17f210c401267930b6c338f14bf3fb2964411ba58`
-- `win-arm64/libmsquic.a`: `a11c853a9c7df534fbb68a2b3a1f660ccfba48c0986a19ea39c2b51a01f02469`
+- `win-arm64/libmsquic.a`: `485c7cc77c04aeaff1dd830e6f3a8ce12ed0e3ac0a0d9e40c46ae0147f704110`
 - `win-arm64/secur32-extra.a`: `0ed53720c4b3e3a5998b1294454fb9cc35102e4ecca6cfa6b3b4636448dcc2f7`
-- `win-x64/libmsquic.a`: `0134f8b56886c15a03ced1dd72792172401742ff852498601d8cdec88b9d454c`
+- `win-x64/libmsquic.a`: `387eed76501e4189f1ab44b31ebd3c72495728807f90ee0bb793dcdec5660de3`
 - `win-x64/secur32-extra.a`: `a88fe400e4c0a3e56709839833e8ad90aa7c51230ba8325a506dcdc204fee760`
 
 Additional .NET 11 Linux crypto shims:
