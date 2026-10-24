@@ -129,11 +129,7 @@ jobs:
       - name: Run local HTTP/3 and certificate validation test
         shell: bash
         run: |
-          if [[ '${{ runner.os }}' == 'Windows' ]]; then
-            ./publish/LightDl.QuicSmoke.exe
-          else
-            ./publish/LightDl.QuicSmoke
-          fi
+          python3 eng/run-quic-smoke.py publish/LightDl.QuicSmoke
       - name: Inspect native dependencies
         shell: bash
         run: python3 eng/inspect-quic-binary.py publish/LightDl.QuicSmoke

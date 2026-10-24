@@ -58,7 +58,12 @@
       <IlcReference Include="$(_LightDlPatchedQuic)" />
     </ItemGroup>
   </Target>
-  <Target Name="LightDlFixStaticQuicLinker" AfterTargets="SetupOSSpecificProps" BeforeTargets="AotAnywhereDirectLinkNative">
+  <Target Name="LightDlFixStaticQuicLinker" AfterTargets="SetupOSSpecificProps" BeforeTargets="AotAnywhereDirectLinkNative;AotAnywhereDirectLinkWindows">
+    <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('win')) and '$(TargetFramework)' == 'net11.0'">
+      <!-- .NET 11's SDK name is not supplied by Zig's MinGW libraries. -->
+      <LinkerArg Remove="&quot;Synchronization.lib&quot;;Synchronization.lib;synchronization.lib" />
+      <LinkerArg Include="api-ms-win-core-synch-l1-2-0.lib" />
+    </ItemGroup>
     <!-- The Linux archive already contains OpenSSL and the .NET crypto shim. -->
     <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('linux'))">
       <NativeLibrary Remove="$(IlcFrameworkNativePath)libSystem.Security.Cryptography.Native.OpenSsl.a" />
