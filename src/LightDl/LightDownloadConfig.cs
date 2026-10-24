@@ -93,6 +93,19 @@ public class LightDownloadConfig
     /// </summary>
     public Func<HttpMessageHandler>? HttpMessageHandlerFactory { get; set; }
 
+    /// <summary>Compares HTTP/2 and HTTP/3 using real download ranges when possible. Enabled by default.
+    /// Requires HTTPS and MsQuic; automatic HTTP/3 probing is skipped with proxies.</summary>
+    public bool EnableHttp3 { get; set; } = true;
+
+    /// <summary>Maximum bytes per protocol sample, clamped to 64 KB–4 MB. Default is 256 KB; samples become part of the file.</summary>
+    public long Http3ProbeSize { get; set; } = 256 * 1024;
+
+    /// <summary>Time budget per protocol sample, including handshake and body. Default is 3 seconds, maximum 30 seconds.</summary>
+    public TimeSpan Http3ProbeTimeout { get; set; } = TimeSpan.FromSeconds(3);
+
+    /// <summary>Reports protocol selection and subsequent fallback. Exceptions in this callback are ignored.</summary>
+    public Action<LightDownloadProtocolSelection>? ProtocolSelectionHandler { get; set; }
+
     /// <summary>Requires HTTP/3 for every request and redirect. Requires HTTPS and a working MsQuic deployment.</summary>
     public bool ForceHttp3 { get; set; }
 
@@ -204,6 +217,10 @@ public class LightDownloadConfig
             Proxy = Proxy,
             UseProxy = UseProxy,
             HttpMessageHandlerFactory = HttpMessageHandlerFactory,
+            EnableHttp3 = EnableHttp3,
+            Http3ProbeSize = Http3ProbeSize,
+            Http3ProbeTimeout = Http3ProbeTimeout,
+            ProtocolSelectionHandler = ProtocolSelectionHandler,
             ForceHttp3 = ForceHttp3,
             UserAgent = UserAgent,
             BufferSize = BufferSize,

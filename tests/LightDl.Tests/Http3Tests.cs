@@ -13,6 +13,7 @@ public sealed class Http3Tests
         using var downloader = new LightDownloader(new LightDownloadConfig
         {
             ForceHttp3 = true,
+            EnableHttp3 = false,
             ChunkCount = 1,
             CheckFreeSpace = false,
             HttpMessageHandlerFactory = () => new Handler(request =>

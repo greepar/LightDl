@@ -185,7 +185,28 @@ To actually require HTTP/3, configure the downloader:
 using var downloader = new LightDownloader(new LightDownloadConfig { ForceHttp3 = true });
 ```
 
-The CLI supports `-h3` / `--http3-only`. This requires HTTPS on every request and redirect, and rejects fallback to HTTP/1.1 or HTTP/2. Deploying MsQuic alone does not change the downloader's default protocol selection.
+The CLI supports `-h3` / `--http3-only`. This requires HTTPS on every request and redirect, and rejects fallback to HTTP/1.1 or HTTP/2. With `ForceHttp3=false` (the default), `EnableHttp3=true` enables automatic selection:
+
+- HTTPS metadata requests negotiate H2, with H1.1 fallback. An H3-only endpoint can be discovered if the TCP probe fails.
+- When MsQuic is available and a missing contiguous range is at least 256 KB, the downloader saves two equal-sized real ranges over H2 and H3. Their data counts toward the file and resume metadata; it is not downloaded again for benchmarking.
+- The faster completed sample wins for the remaining ranges. A failed or timed-out candidate does not consume the download's retry budget. An unavailable H3 candidate leaves H2/H1.1 available.
+- Sampling uses up to `Http3ProbeSize` bytes per protocol (256 KB by default, clamped to 64 KB–4 MB). Each sample has a `Http3ProbeTimeout` budget (3 seconds by default, at most 30 seconds). Measurements include connection setup, transfer and file writes, so they describe this download rather than a guarantee about future throughput.
+- Two samples run concurrently within the configured worker count, or sequentially with `ChunkCount=1`. HTTP proxies skip H3 probing. Small files, fragmented resumes without a sufficiently large missing range, and non-range transfers do not perform the speed comparison.
+- The choice is per download and origin. A selected H3 transport that fails mid-transfer switches to H2 and requeues only bytes that have not been written. Changing origins clears the H3 preference. Authentication, entity-change and local storage failures keep their normal handling.
+
+Inspect the choice and measured bytes/sec:
+
+```csharp
+var config = new LightDownloadConfig
+{
+    ProtocolSelectionHandler = selection => Console.WriteLine(
+        $"Selected HTTP/{selection.SelectedVersion}: H2={selection.Http2Speed}, H3={selection.Http3Speed}")
+};
+using var downloader = new LightDownloader(config);
+// downloader.SelectedHttpVersion also exposes the selected preference.
+```
+
+Set `EnableHttp3=false` (CLI: `--no-http3`) to disable automatic H3 probing. H2 can still negotiate H1.1. `ForceHttp3=true` overrides this opt-out and never falls back. The CLI's `--verbose` output reports protocol measurements and fallback decisions.
 
 Native archive provenance, validation results, and local package instructions are in [eng/STATIC-QUIC.md](eng/STATIC-QUIC.md).
 

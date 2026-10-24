@@ -115,6 +115,9 @@ consumer. Its 16 static AOT jobs cover both frameworks on all eight RIDs. Each j
 - Confirms that default certificate validation rejects its untrusted certificate.
 - Explicitly permits that test certificate, downloads a 1 MB payload with multiple
   HTTP/3 range requests, and validates SHA-256.
+- Compares real H2/H3 range throughput with a deterministic slow protocol, verifies
+  that each protocol can win and remain selected, and exercises H3-unavailable
+  and selected-H3-stream-reset recovery without a retry budget.
 - Rejects MsQuic sidecars and inspects the executable's native dependencies.
 - For musl, also requires no ELF interpreter or dynamic dependencies.
 

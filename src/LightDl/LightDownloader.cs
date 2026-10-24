@@ -15,7 +15,7 @@ namespace LightDl;
 /// <summary>
 /// Lightweight multi-threaded downloader based on HttpClient. Use one instance per active download.
 /// </summary>
-public sealed class LightDownloader : IDisposable
+public sealed partial class LightDownloader : IDisposable
 {
     /// <summary>Reported as <see cref="LightDownloadFileInfo.Size" /> when the server does not declare a length.</summary>
     public const long UnknownSize = -1;
@@ -42,6 +42,10 @@ public sealed class LightDownloader : IDisposable
     private long _lastMetadataSaveTimestamp;
     private int _isDownloading;
     private int _disposed;
+    private Version? _selectedHttpVersion;
+
+    /// <summary>Preferred HTTP version for the current/last download; HTTP/2 may negotiate HTTP/1.1.</summary>
+    public Version? SelectedHttpVersion => Volatile.Read(ref _selectedHttpVersion);
 
     public LightDownloader(LightDownloadConfig? config = null)
     {
@@ -104,6 +108,7 @@ public sealed class LightDownloader : IDisposable
 
         try
         {
+            Volatile.Write(ref _selectedHttpVersion, null);
             return await DownloadCoreAsync(request, progress, fileInfo, cancellationToken).ConfigureAwait(false);
         }
         finally
@@ -182,7 +187,13 @@ public sealed class LightDownloader : IDisposable
         var urlString = request.Url;
         var headers = request.Headers;
         var probe = await ProbeFileInfoAsync(url, headers, ct).ConfigureAwait(false);
-        var downloadTarget = new DownloadTarget(url, probe.DownloadUri, headers);
+        Volatile.Write(ref _selectedHttpVersion, probe.HttpVersion);
+        var downloadTarget = new DownloadTarget(url, probe.DownloadUri, headers, probe.HttpVersion, _config.ForceHttp3,
+            selection =>
+            {
+                Volatile.Write(ref _selectedHttpVersion, selection.SelectedVersion);
+                SafeInvoke(() => _config.ProtocolSelectionHandler?.Invoke(selection));
+            });
         var progressChanged = BuildProgressReporter(progress, request);
 
         var totalLength = probe.Size;
@@ -303,6 +314,26 @@ public sealed class LightDownloader : IDisposable
         using var failureCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var linkedCt = failureCts.Token;
 
+        if (!_config.ForceHttp3 && totalLength - completedBytes >= MinimumProtocolRangeSize &&
+            CanProbeHttp3(probe.DownloadUri) &&
+            allocator.TryRentProtocolSamples(_config.Http3ProbeSize, out var h2Sample, out var h3Sample))
+        {
+            try
+            {
+                await CompareProtocolsAsync(downloadTarget, h2Sample, h3Sample, tempPath, totalLength,
+                    probe, stopwatch,
+                    bytes => { downloaded.Add(bytes); sessionDownloaded.Add(bytes); },
+                    sessionDownloaded.Read,
+                    (start, end) => AddCompletedRange(metadata, metadataPath, start, end),
+                    retryQueue, throttle, linkedCt).ConfigureAwait(false);
+            }
+            catch
+            {
+                ForceSaveMetadata(metadata, metadataPath);
+                throw;
+            }
+        }
+
         using var progressCts = new CancellationTokenSource();
         var progressTask = ReportProgressAndAdaptLoop(
             progressCts.Token,
@@ -367,6 +398,7 @@ public sealed class LightDownloader : IDisposable
                     }
 
                     Interlocked.Increment(ref activeSegments);
+                    var segmentProtocol = downloadTarget.GetProtocol(downloadTarget.GetRequestTarget().Uri);
                     try
                     {
                         await DownloadChunkAsync(downloadTarget, tempPath, segment.Start, segment.End,
@@ -381,7 +413,7 @@ public sealed class LightDownloader : IDisposable
                                 Volatile.Read(ref currentConcurrency)),
                             totalLength, stopwatch, probe.IfRange, probe.ContentType,
                             (rangeStart, rangeEnd) => AddCompletedRange(metadata, metadataPath, rangeStart, rangeEnd),
-                            linkedCt).ConfigureAwait(false);
+                            linkedCt, onProtocol: version => segmentProtocol = version).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException) when (linkedCt.IsCancellationRequested)
                     {
@@ -394,7 +426,12 @@ public sealed class LightDownloader : IDisposable
                             AddCompletedRange(metadata, metadataPath, segment.Start,
                                 Math.Min(nextStart - 1, segment.End));
 
-                        if (!IsRetryable(ex) || segment.RetryCount >= _config.MaxRetry)
+                        var protocolFallback = !_config.ForceHttp3 && segmentProtocol == HttpVersion.Version30 &&
+                            ex is SegmentRetryException { ProtocolFailure: true };
+                        if (protocolFallback)
+                            downloadTarget.FallbackProtocol();
+
+                        if (!IsRetryable(ex) || (!protocolFallback && segment.RetryCount >= _config.MaxRetry))
                         {
                             if (failure.TrySet(ex))
                                 await failureCts.CancelAsync();
@@ -403,7 +440,10 @@ public sealed class LightDownloader : IDisposable
                         }
 
                         if (nextStart <= segment.End)
-                            retryQueue.Enqueue(new DownloadSegment(nextStart, segment.End, segment.RetryCount + 1));
+                            retryQueue.Enqueue(new DownloadSegment(nextStart, segment.End, segment.RetryCount + (protocolFallback ? 0 : 1)));
+
+                        if (protocolFallback)
+                            continue;
 
                         if (ex is SegmentRetryException { Throttled: true } throttled)
                             throttle?.Trip(throttled.RetryAfter);
@@ -549,8 +589,28 @@ public sealed class LightDownloader : IDisposable
     private async Task<ProbeResult> ProbeOnceAsync(Uri url, IReadOnlyDictionary<string, string>? headers,
         CancellationToken ct)
     {
-        var response = await SendWithRedirectsAsync(url, headers, new RangeHeaderValue(0, 0), ifRange: null, ct)
-            .ConfigureAwait(false);
+        HttpResponseMessage response;
+        try
+        {
+            response = await SendWithRedirectsAsync(url, headers, new RangeHeaderValue(0, 0), ifRange: null, ct)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (!_config.ForceHttp3 && !ct.IsCancellationRequested &&
+                                   CanProbeHttp3(url) && IsProtocolTransportFailure(ex))
+        {
+            using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            probeCts.CancelAfter(_config.Http3ProbeTimeout);
+            try
+            {
+                response = await SendWithRedirectsAsync(url, headers, new RangeHeaderValue(0, 0), ifRange: null,
+                    probeCts.Token, probeVersion: HttpVersion.Version30).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException timeout) when (!ct.IsCancellationRequested)
+            {
+                throw new HttpRequestException(HttpRequestError.ConnectionError,
+                    "HTTP/3 discovery timed out after the TCP probe failed.", timeout);
+            }
+        }
         try
         {
             // Some servers reject a range probe outright; a plain GET still works for them.
@@ -620,7 +680,8 @@ public sealed class LightDownloader : IDisposable
                 // equivalence, and Last-Modified is restamped per response by some origins
                 // (signed CDN URLs), which would make every range request fail validation.
                 eTag is { IsWeak: false } ? eTag.ToString() : null,
-                lastModified);
+                lastModified,
+                response.Version);
         }
         finally
         {
@@ -642,7 +703,9 @@ public sealed class LightDownloader : IDisposable
         string? ifRange,
         string? expectedContentType,
         Action<long, long> onRangeCompleted,
-        CancellationToken ct)
+        CancellationToken ct,
+        Version? probeVersion = null,
+        Action<Version>? onProtocol = null)
     {
         var currentOffset = start;
         var lastCommittedOffset = start;
@@ -652,9 +715,13 @@ public sealed class LightDownloader : IDisposable
 
         try
         {
-            using var response = await SendRangeRequestAsync(target, start, end, totalLength, ifRange, expectedContentType, ct)
+            using var response = await SendRangeRequestAsync(target, start, end, totalLength, ifRange, expectedContentType, ct, probeVersion)
                 .ConfigureAwait(false);
 
+            if (probeVersion is not null && response.Version != probeVersion)
+                throw new HttpRequestException(HttpRequestError.VersionNegotiationError,
+                    $"The protocol sample requested HTTP/{probeVersion} but received HTTP/{response.Version}.");
+            onProtocol?.Invoke(response.Version);
             await using var source = await response.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
             await using var dest = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite,
                 bufferSize: 1, FileOptions.Asynchronous);
@@ -702,7 +769,7 @@ public sealed class LightDownloader : IDisposable
             // A clean EOF before the end of the range still means the range is incomplete.
             if (currentOffset <= end)
                 throw new SegmentRetryException(currentOffset,
-                    $"the server closed the connection {end - currentOffset + 1} byte(s) before the end of the range.");
+                    $"the server closed the connection {end - currentOffset + 1} byte(s) before the end of the range.", protocolFailure: true);
         }
         catch (SegmentRetryException)
         {
@@ -744,7 +811,7 @@ public sealed class LightDownloader : IDisposable
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             throw new SegmentRetryException(offset,
-                $"no data was received for {stallTimeout.TotalSeconds:0.#}s; the connection will be requeued.");
+                $"no data was received for {stallTimeout.TotalSeconds:0.#}s; the connection will be requeued.", protocolFailure: true);
         }
     }
 
@@ -1329,23 +1396,31 @@ public sealed class LightDownloader : IDisposable
         long totalLength,
         string? ifRange,
         string? expectedContentType,
-        CancellationToken ct)
+        CancellationToken ct,
+        Version? probeVersion = null)
     {
         while (true)
         {
             var requestTarget = target.GetRequestTarget();
+            var tryingHttp3 = !_config.ForceHttp3 && probeVersion is null &&
+                target.GetProtocol(requestTarget.Uri) == HttpVersion.Version30;
             HttpResponseMessage response;
             try
             {
                 response = await SendWithRedirectsAsync(requestTarget.Uri, requestTarget.Headers,
-                    new RangeHeaderValue(start, end), ifRange, ct).ConfigureAwait(false);
+                    new RangeHeaderValue(start, end), ifRange, ct, probeVersion, target).ConfigureAwait(false);
             }
-            catch (HttpRequestException) when (requestTarget.IsDirect)
+            catch (Exception ex) when (tryingHttp3 && !ct.IsCancellationRequested && IsProtocolTransportFailure(ex))
+            {
+                target.FallbackProtocol();
+                continue;
+            }
+            catch (HttpRequestException) when (requestTarget.IsDirect && probeVersion is null)
             {
                 target.Fallback();
                 continue;
             }
-            catch (OperationCanceledException) when (requestTarget.IsDirect && !ct.IsCancellationRequested)
+            catch (OperationCanceledException) when (requestTarget.IsDirect && probeVersion is null && !ct.IsCancellationRequested)
             {
                 target.Fallback();
                 continue;
@@ -1413,11 +1488,17 @@ public sealed class LightDownloader : IDisposable
         while (true)
         {
             var requestTarget = target.GetRequestTarget();
+            var tryingHttp3 = !_config.ForceHttp3 && target.GetProtocol(requestTarget.Uri) == HttpVersion.Version30;
             HttpResponseMessage response;
             try
             {
                 response = await SendWithRedirectsAsync(requestTarget.Uri, requestTarget.Headers, range: null,
-                    ifRange: null, ct).ConfigureAwait(false);
+                    ifRange: null, ct, target: target).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (tryingHttp3 && !ct.IsCancellationRequested && IsProtocolTransportFailure(ex))
+            {
+                target.FallbackProtocol();
+                continue;
             }
             catch (HttpRequestException) when (requestTarget.IsDirect)
             {
@@ -1530,22 +1611,27 @@ public sealed class LightDownloader : IDisposable
         IReadOnlyDictionary<string, string>? headers,
         RangeHeaderValue? range,
         string? ifRange,
-        CancellationToken ct)
+        CancellationToken ct,
+        Version? probeVersion = null,
+        DownloadTarget? target = null)
     {
         var currentUri = uri;
         var currentHeaders = headers;
 
         for (var redirectCount = 0;; redirectCount++)
         {
-            if (_config.ForceHttp3 && currentUri.Scheme != Uri.UriSchemeHttps)
+            if ((_config.ForceHttp3 || probeVersion == HttpVersion.Version30) && currentUri.Scheme != Uri.UriSchemeHttps)
                 throw new HttpRequestException("HTTP/3 requires HTTPS, including redirect targets.");
 
             using var request = new HttpRequestMessage(HttpMethod.Get, currentUri);
-            if (_config.ForceHttp3)
-            {
-                request.Version = HttpVersion.Version30;
-                request.VersionPolicy = HttpVersionPolicy.RequestVersionExact;
-            }
+            request.Version = _config.ForceHttp3 ? HttpVersion.Version30 :
+                probeVersion ?? target?.GetProtocol(currentUri) ??
+                (currentUri.Scheme == Uri.UriSchemeHttps ? HttpVersion.Version20 : HttpVersion.Version11);
+            request.VersionPolicy = _config.ForceHttp3 || probeVersion is not null || request.Version == HttpVersion.Version30
+                ? HttpVersionPolicy.RequestVersionExact : HttpVersionPolicy.RequestVersionOrLower;
+            if (probeVersion is not null && target is not null && !HaveSameAuthority(currentUri, target.ProtocolOrigin))
+                throw new HttpRequestException(HttpRequestError.VersionNegotiationError,
+                    "A protocol sample was redirected to a different origin.");
             request.Headers.Range = range;
             // Any content coding would break the mapping between response bytes and file offsets.
             request.Headers.TryAddWithoutValidation("Accept-Encoding", "identity");
@@ -1921,6 +2007,11 @@ public sealed class LightDownloader : IDisposable
     private static void NormalizeConfig(LightDownloadConfig config)
     {
         config.BufferSize = Math.Max(config.BufferSize, 8 * 1024);
+        config.Http3ProbeSize = Math.Clamp(config.Http3ProbeSize, 64 * 1024, 4 * 1024 * 1024);
+        if (config.Http3ProbeTimeout <= TimeSpan.Zero)
+            config.Http3ProbeTimeout = TimeSpan.FromSeconds(3);
+        if (config.Http3ProbeTimeout > TimeSpan.FromSeconds(30))
+            config.Http3ProbeTimeout = TimeSpan.FromSeconds(30);
 
         // Ordering matters here: clamping against an un-normalised bound either throws or silently
         // overrides an explicit ChunkCount. MinChunkCount only bounds dynamic concurrency, so it
@@ -2061,6 +2152,31 @@ public sealed class LightDownloader : IDisposable
             }
         }
 
+        public bool TryRentProtocolSamples(long maximumSize, out DownloadSegment first, out DownloadSegment second)
+        {
+            lock (_lock)
+            {
+                // Keep samples equal and leave at least half this range for the chosen protocol.
+                // Tiny/fragmented resumes are better completed without a new comparison.
+                for (var i = _ranges.Count; i > 0; i--)
+                {
+                    var range = _ranges.Dequeue();
+                    var length = range.End - range.Start + 1;
+                    if (length >= MinimumProtocolRangeSize)
+                    {
+                        var size = Math.Min(maximumSize, length / 4);
+                        first = new DownloadSegment(range.Start, range.Start + size - 1, 0);
+                        second = new DownloadSegment(first.End + 1, first.End + size, 0);
+                        _ranges.Enqueue(new DownloadRange(second.End + 1, range.End));
+                        return true;
+                    }
+                    _ranges.Enqueue(range);
+                }
+                first = second = default;
+                return false;
+            }
+        }
+
         public bool TryRent(long size, out DownloadSegment segment)
         {
             lock (_lock)
@@ -2105,7 +2221,8 @@ public sealed class LightDownloader : IDisposable
         Uri DownloadUri,
         string? ETag,
         string? IfRange,
-        string? LastModified)
+        string? LastModified,
+        Version HttpVersion)
     {
         public LightDownloadFileInfo CreateFileInfo(string destinationPath) => new()
         {
@@ -2125,14 +2242,59 @@ public sealed class LightDownloader : IDisposable
         private readonly IReadOnlyDictionary<string, string>? _directHeaders;
         private readonly bool _hasDirectUri;
         private int _useFallback;
+        private Version _protocol;
+        private readonly bool _forceHttp3;
+        private readonly Action<LightDownloadProtocolSelection> _onSelection;
+        public Uri ProtocolOrigin { get; }
 
-        public DownloadTarget(Uri originalUri, Uri directUri, IReadOnlyDictionary<string, string>? headers)
+        public DownloadTarget(Uri originalUri, Uri directUri, IReadOnlyDictionary<string, string>? headers,
+            Version protocol, bool forceHttp3, Action<LightDownloadProtocolSelection> onSelection)
         {
+            _protocol = protocol == HttpVersion.Version30 ? HttpVersion.Version30 : protocol;
+            _forceHttp3 = forceHttp3;
+            ProtocolOrigin = directUri;
+            _onSelection = onSelection;
             _originalUri = originalUri;
             _directUri = directUri;
             _originalHeaders = headers;
             _directHeaders = HaveSameAuthority(originalUri, directUri) ? headers : WithoutSensitiveHeaders(headers);
             _hasDirectUri = originalUri != directUri;
+        }
+
+        public Version GetProtocol(Uri uri)
+        {
+            if (_forceHttp3)
+                return HttpVersion.Version30;
+            if (uri.Scheme != Uri.UriSchemeHttps)
+            {
+                FallbackProtocol();
+                return HttpVersion.Version11;
+            }
+            if (!HaveSameAuthority(uri, ProtocolOrigin))
+            {
+                FallbackProtocol();
+                return HttpVersion.Version20;
+            }
+            return Volatile.Read(ref _protocol);
+        }
+
+        public void SelectProtocol(Version version, double? http2Speed, double? http3Speed)
+        {
+            Volatile.Write(ref _protocol, version);
+            _onSelection(new LightDownloadProtocolSelection
+            {
+                Origin = ProtocolOrigin, SelectedVersion = version,
+                Http2Speed = http2Speed, Http3Speed = http3Speed
+            });
+        }
+
+        public void FallbackProtocol()
+        {
+            if (Interlocked.CompareExchange(ref _protocol, HttpVersion.Version20, HttpVersion.Version30) == HttpVersion.Version30)
+                _onSelection(new LightDownloadProtocolSelection
+                {
+                    Origin = ProtocolOrigin, SelectedVersion = HttpVersion.Version20, IsFallback = true
+                });
         }
 
         public RequestTarget GetRequestTarget()
@@ -2185,13 +2347,16 @@ public sealed class LightDownloader : IDisposable
         string message,
         TimeSpan? retryAfter = null,
         Exception? innerException = null,
-        bool throttled = false)
+        bool throttled = false,
+        bool protocolFailure = false)
         : Exception(message, innerException)
     {
         public SegmentRetryException(long nextStart, string message, Exception? innerException)
-            : this(nextStart, message, null, innerException)
+            : this(nextStart, message, null, innerException, protocolFailure: IsProtocolTransportFailure(innerException))
         {
         }
+
+        public bool ProtocolFailure { get; } = protocolFailure;
 
         public long NextStart { get; } = nextStart;
 

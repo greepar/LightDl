@@ -40,12 +40,21 @@ static async Task<int> RunAsync(string[] args)
     var config = new LightDownloadConfig
     {
         EnableResume = options.EnableResume,
+        EnableHttp3 = options.EnableHttp3,
         ForceHttp3 = options.ForceHttp3,
         IgnoreSslErrors = options.IgnoreSslErrors
     };
 
     if (options.Verbose)
     {
+        config.ProtocolSelectionHandler = selection =>
+        {
+            var h2 = selection.Http2Speed is { } speed2 ? FormatBytes(speed2) + "/s" : "unavailable";
+            var h3 = selection.Http3Speed is { } speed3 ? FormatBytes(speed3) + "/s" : "unavailable";
+            Console.Error.WriteLine(selection.IsFallback
+                ? $"\nProtocol fallback: HTTP/{selection.SelectedVersion}"
+                : $"\nProtocol: HTTP/{selection.SelectedVersion} (H2 {h2}, H3 {h3})");
+        };
         config.RetryHandler = retry =>
         {
             // The probe has no range yet, so it reports End as -1 rather than a byte offset.
@@ -137,6 +146,7 @@ static CliOptions ParseArguments(string[] args)
     var ignoreSslErrors = false;
     var verbose = false;
     var forceHttp3 = false;
+    var enableHttp3 = true;
     var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
     for (var i = 0; i < args.Length; i++)
@@ -151,6 +161,10 @@ static CliOptions ParseArguments(string[] args)
             case "-v":
             case "--version":
                 return new CliOptions { ShowVersion = true };
+
+            case "--no-http3":
+                enableHttp3 = false;
+                break;
 
             case "-h3":
             case "--http3-only":
@@ -232,6 +246,7 @@ static CliOptions ParseArguments(string[] args)
 
     return new CliOptions
     {
+        EnableHttp3 = enableHttp3,
         ForceHttp3 = forceHttp3,
         Verbose = verbose,
         Url = uri.AbsoluteUri,
@@ -317,6 +332,7 @@ static void PrintHelp()
               --directory           Treat the output path as a directory (default)
           -c, --chunks <count>      Number of download workers
               --conflict <policy>   rename, overwrite, fail, or skip (default: rename)
+              --no-http3            Disable automatic HTTP/3 comparison
           -h3, --http3-only         Require HTTP/3 (HTTPS and MsQuic required)
               --no-resume           Disable resume support
               --ignore-ssl-errors   Ignore TLS certificate validation errors
@@ -338,6 +354,7 @@ file sealed class CliOptions
     public bool ShowHelp { get; init; }
     public bool ShowVersion { get; init; }
     public bool Verbose { get; init; }
+    public bool EnableHttp3 { get; init; } = true;
     public bool ForceHttp3 { get; init; }
     public string? Url { get; init; }
     public string? DestinationPath { get; init; }
