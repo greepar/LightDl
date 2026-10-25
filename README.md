@@ -185,7 +185,19 @@ To actually require HTTP/3, configure the downloader:
 using var downloader = new LightDownloader(new LightDownloadConfig { ForceHttp3 = true });
 ```
 
-The CLI supports `-h3` / `--http3-only`. This requires HTTPS on every request and redirect, and rejects fallback to HTTP/1.1 or HTTP/2. With `ForceHttp3=false` (the default), `EnableHttp3=true` enables automatic selection:
+The CLI supports `-h3` / `--http3-only`. This requires HTTPS on every request and redirect, and rejects fallback to HTTP/1.1 or HTTP/2. With `ForceHttp3=false` (the default), `EnableHttp3=true` enables automatic selection.
+
+HTTP/3 connection pools automatically follow the current worker concurrency by default (`Http3ConnectionCount=0`). Dynamic concurrency changes and server-throttle backoff also update the number of pools used for new requests, up to 32. Existing streams finish normally. Set `Http3ConnectionCount` (CLI: `--h3-connections`) to a positive number to cap the pools; `1` restores a single pool. Extra connections are opened only for H3 ranges. Metadata, non-range transfers and H2 use the primary pool. A custom `HttpMessageHandlerFactory` manages its own connections and bypasses this option.
+
+For example, test 24 workers across 24 H3 pools:
+
+```bash
+lightdl https://patch.qwq.lu/kiss ./downloads --chunks 24 --http3-only --verbose
+```
+
+More connections can help a lossy or high-latency path, but also add handshakes and server load. See [H3 measurements and benchmark commands](eng/H3-PERFORMANCE.md).
+
+Automatic protocol selection works as follows:
 
 - HTTPS metadata requests negotiate H2, with H1.1 fallback. An H3-only endpoint can be discovered if the TCP probe fails.
 - When MsQuic is available and a missing contiguous range is at least 256 KB, the downloader saves two equal-sized real ranges over H2 and H3. Their data counts toward the file and resume metadata; it is not downloaded again for benchmarking.

@@ -35,6 +35,7 @@ public sealed partial class LightDownloader : IDisposable
 
     private readonly LightDownloadConfig _config;
     private readonly HttpClient _http;
+    private readonly Http3ConnectionPoolHandler? _http3Pools;
     private readonly Lock _metadataLock = new();
     private readonly Lock _metadataFileLock = new();
     private long _metadataVersion;
@@ -60,29 +61,44 @@ public sealed partial class LightDownloader : IDisposable
         }
         else
         {
-            var socketsHandler = new SocketsHttpHandler
+            SocketsHttpHandler CreateSocketsHandler()
             {
-                AllowAutoRedirect = false,
-                AutomaticDecompression = DecompressionMethods.None,
-                // Redirects and the Cookie header are handled here; letting the handler add its own
-                // cookies on top would duplicate or override caller-supplied credentials.
-                UseCookies = false,
-                ConnectTimeout = _config.ConnectTimeout,
-                MaxConnectionsPerServer = Math.Max(_config.MaxChunkCount, _config.ChunkCount) * 2,
-                PooledConnectionLifetime = TimeSpan.FromMinutes(2),
-                Proxy = _config.Proxy,
-                UseProxy = _config.UseProxy,
-            };
-
-            if (_config.IgnoreSslErrors)
-            {
-                socketsHandler.SslOptions = new SslClientAuthenticationOptions
+                var socketsHandler = new SocketsHttpHandler
                 {
-                    RemoteCertificateValidationCallback = delegate { return true; }
+                    AllowAutoRedirect = false,
+                    AutomaticDecompression = DecompressionMethods.None,
+                    // Redirects and the Cookie header are handled here; letting the handler add its own
+                    // cookies on top would duplicate or override caller-supplied credentials.
+                    UseCookies = false,
+                    ConnectTimeout = _config.ConnectTimeout,
+                    MaxConnectionsPerServer = Math.Max(_config.MaxChunkCount, _config.ChunkCount) * 2,
+                    PooledConnectionLifetime = TimeSpan.FromMinutes(2),
+                    Proxy = _config.Proxy,
+                    UseProxy = _config.UseProxy,
                 };
+
+                if (_config.IgnoreSslErrors)
+                {
+                    socketsHandler.SslOptions = new SslClientAuthenticationOptions
+                    {
+                        RemoteCertificateValidationCallback = delegate { return true; }
+                    };
+                }
+
+                return socketsHandler;
             }
 
-            handler = socketsHandler;
+            var workerLimit = _config.EnableDynamicConcurrency ? _config.MaxChunkCount : _config.ChunkCount;
+            var poolLimit = _config.Http3ConnectionCount == 0
+                ? Math.Min(32, workerLimit) : _config.Http3ConnectionCount;
+            if ((_config.EnableHttp3 || _config.ForceHttp3) && poolLimit > 1)
+            {
+                _http3Pools = new Http3ConnectionPoolHandler(CreateSocketsHandler, poolLimit);
+                _http3Pools.SetConcurrency(_config.ChunkCount);
+                handler = _http3Pools;
+            }
+            else
+                handler = CreateSocketsHandler();
         }
 
         _http = new HttpClient(handler) { Timeout = _config.Timeout };
@@ -293,6 +309,12 @@ public sealed partial class LightDownloader : IDisposable
         var downloaded = new AtomicLong(completedBytes);
         var sessionDownloaded = new AtomicLong();
         var currentConcurrency = Math.Min(_config.ChunkCount, _config.MaxChunkCount);
+        void SetConcurrency(int value)
+        {
+            _http3Pools?.SetConcurrency(value);
+            Volatile.Write(ref currentConcurrency, value);
+        }
+        SetConcurrency(currentConcurrency);
         var currentSegmentSize = CalculateStableSegmentSize(totalLength, currentConcurrency);
         // Throttle recovery may only climb back to what the caller actually asked for. Without
         // dynamic concurrency that is ChunkCount, and no worker exists above it to use the slot.
@@ -306,7 +328,7 @@ public sealed partial class LightDownloader : IDisposable
                 _config.ThrottleBackoffDelay,
                 _config.ThrottleRecoveryInterval,
                 () => Volatile.Read(ref currentConcurrency),
-                value => Volatile.Write(ref currentConcurrency, value))
+                SetConcurrency)
             : null;
 
         // A segment that fails for good must stop the whole download immediately: without this the
@@ -342,7 +364,7 @@ public sealed partial class LightDownloader : IDisposable
             progressChanged,
             () => Volatile.Read(ref activeSegments),
             () => Volatile.Read(ref currentConcurrency),
-            value => Volatile.Write(ref currentConcurrency, value),
+            SetConcurrency,
             () => Interlocked.Read(ref currentSegmentSize),
             value => Interlocked.Exchange(ref currentSegmentSize, value),
             throttle,
@@ -2025,6 +2047,8 @@ public sealed partial class LightDownloader : IDisposable
         config.ChunkCount = Math.Max(config.ChunkCount, 1);
         config.MinChunkCount = Math.Clamp(config.MinChunkCount, 1, config.ChunkCount);
         config.MaxChunkCount = Math.Max(config.MaxChunkCount, config.ChunkCount);
+        config.Http3ConnectionCount = Math.Clamp(config.Http3ConnectionCount, 0,
+            Math.Min(32, config.EnableDynamicConcurrency ? config.MaxChunkCount : config.ChunkCount));
 
         config.MinSegmentSize = Math.Max(config.MinSegmentSize, config.BufferSize);
         config.MaxSegmentSize = Math.Max(config.MaxSegmentSize, config.MinSegmentSize);

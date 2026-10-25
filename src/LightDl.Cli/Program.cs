@@ -66,6 +66,8 @@ static async Task<int> RunAsync(string[] args)
 
     if (options.ChunkCount is { } chunkCount)
         config.ChunkCount = chunkCount;
+    if (options.Http3ConnectionCount is { } http3ConnectionCount)
+        config.Http3ConnectionCount = http3ConnectionCount;
 
     if (options.ConflictPolicy is { } conflictPolicy)
         config.FileConflictPolicy = conflictPolicy;
@@ -141,6 +143,7 @@ static CliOptions ParseArguments(string[] args)
     string? destination = null;
     var destinationKind = LightDownloadDestinationKind.Directory;
     int? chunkCount = null;
+    int? http3ConnectionCount = null;
     LightDownloadFileConflictPolicy? conflictPolicy = null;
     var enableResume = true;
     var ignoreSslErrors = false;
@@ -173,6 +176,12 @@ static CliOptions ParseArguments(string[] args)
 
             case "--verbose":
                 verbose = true;
+                break;
+
+            case "--h3-connections":
+                if (!int.TryParse(ReadValue(args, ref i, argument), out var connectionCount) || connectionCount < 0)
+                    throw new ArgumentException("HTTP/3 connection count must be non-negative (0 means automatic).");
+                http3ConnectionCount = connectionCount;
                 break;
 
             case "-o":
@@ -253,6 +262,7 @@ static CliOptions ParseArguments(string[] args)
         DestinationPath = destination,
         DestinationKind = destinationKind,
         ChunkCount = chunkCount,
+        Http3ConnectionCount = http3ConnectionCount,
         ConflictPolicy = conflictPolicy,
         EnableResume = enableResume,
         IgnoreSslErrors = ignoreSslErrors,
@@ -331,6 +341,7 @@ static void PrintHelp()
               --file                Treat the output path as an exact file path
               --directory           Treat the output path as a directory (default)
           -c, --chunks <count>      Number of download workers
+              --h3-connections <n>  HTTP/3 pool cap; 0 follows workers (default, max 32)
               --conflict <policy>   rename, overwrite, fail, or skip (default: rename)
               --no-http3            Disable automatic HTTP/3 comparison
           -h3, --http3-only         Require HTTP/3 (HTTPS and MsQuic required)
@@ -360,6 +371,7 @@ file sealed class CliOptions
     public string? DestinationPath { get; init; }
     public LightDownloadDestinationKind DestinationKind { get; init; }
     public int? ChunkCount { get; init; }
+    public int? Http3ConnectionCount { get; init; }
     public LightDownloadFileConflictPolicy? ConflictPolicy { get; init; }
     public bool EnableResume { get; init; } = true;
     public bool IgnoreSslErrors { get; init; }
