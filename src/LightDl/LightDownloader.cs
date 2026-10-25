@@ -340,6 +340,7 @@ public sealed partial class LightDownloader : IDisposable
             downloaded.Read,
             totalLength,
             progressChanged,
+            () => Volatile.Read(ref activeSegments),
             () => Volatile.Read(ref currentConcurrency),
             value => Volatile.Write(ref currentConcurrency, value),
             () => Interlocked.Read(ref currentSegmentSize),
@@ -913,6 +914,8 @@ public sealed partial class LightDownloader : IDisposable
                 DownloadedBytes = nowBytes,
                 TotalBytes = Math.Max(total, 0),
                 Speed = speed,
+                ActiveWorkers = 1,
+                ConcurrencyLimit = 1,
             });
         }
     }
@@ -922,6 +925,7 @@ public sealed partial class LightDownloader : IDisposable
         Func<long> getDownloaded,
         long total,
         Action<LightDownloadProgress>? progressChanged,
+        Func<int> getActiveWorkers,
         Func<int> getConcurrency,
         Action<int> setConcurrency,
         Func<long> getSegmentSize,
@@ -950,6 +954,8 @@ public sealed partial class LightDownloader : IDisposable
                 DownloadedBytes = nowBytes,
                 TotalBytes = Math.Max(total, 0),
                 Speed = speed,
+                ActiveWorkers = getActiveWorkers(),
+                ConcurrencyLimit = getConcurrency(),
             });
 
             if (DateTimeOffset.UtcNow - lastAdapt >= _config.AdaptInterval)

@@ -40,6 +40,35 @@ public sealed class DownloadTests : IDisposable
         ThrottleBackoffDelay = TimeSpan.FromMilliseconds(5)
     });
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Progress_Reports_Active_Workers_And_Zero_On_Completion(bool ranged)
+    {
+        var origin = new FakeOrigin(MakeContent(4 * 1024 * 1024))
+        {
+            SupportsRange = ranged,
+            BodyDelay = TimeSpan.FromMilliseconds(10)
+        };
+        var config = BaseConfig(origin);
+        config.EnableHttp3 = false;
+        var reports = new System.Collections.Concurrent.ConcurrentQueue<LightDownloadProgress>();
+        var request = LightDownloadRequest.ToFile(Url, Path("worker-progress.bin"));
+        request.OnProgress(reports.Enqueue);
+        using var downloader = new LightDownloader(config);
+        await downloader.DownloadAsync(request);
+
+        var active = reports.Where(p => p.ActiveWorkers > 0).ToArray();
+        Assert.NotEmpty(active);
+        Assert.All(active, p =>
+        {
+            Assert.InRange(p.ActiveWorkers, 1, ranged ? 4 : 1);
+            Assert.Equal(ranged ? 4 : 1, p.ConcurrencyLimit);
+        });
+        Assert.Equal(0, reports.Last().ActiveWorkers);
+        Assert.Equal(0, reports.Last().ConcurrencyLimit);
+    }
+
     // --- Regression: an explicit ChunkCount must not be raised by MinChunkCount ------------------
 
     [Fact]
